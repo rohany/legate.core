@@ -78,6 +78,9 @@ struct construct_overlapping_region_group_fn {
     for (const auto& pair : instances) {
       auto& group = pair.first;
 
+      // TODO (rohany): Don't know what to do here around sparse instances.
+      if (!group->bounding_box.dense()) continue;
+
       Rect<DIM> group_bbox = group->bounding_box;
       auto intersect       = bound.intersection(group_bbox);
       if (intersect.empty()) continue;
