@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Protocol, Tuple
 import numpy as np
 
 from . import AffineTransform
+from . import Transform as LegionTransform
 from .partition import Replicate, Restriction, Tiling
 from .projection import ProjExpr
 from .shape import Shape
@@ -85,6 +86,9 @@ class TransformProto(Protocol):
         ...
 
     def get_inverse_transform(self, ndim: int) -> AffineTransform:
+        ...
+
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
         ...
 
 
@@ -173,6 +177,9 @@ class Shift(Transform):
         result = AffineTransform(ndim, ndim, True)
         result.offset[self._dim] = -self._offset
         return result
+
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        raise NotImplementedError("Not implemented yet")
 
     def serialize(self, buf: BufferBuilder) -> None:
         code = self._runtime.get_transform_code(self.__class__.__name__)
@@ -276,6 +283,16 @@ class Promote(Transform):
                 parent_dim += 1
         return result
 
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        parent_ndim = ndim - 1
+        result = LegionTransform(parent_ndim, ndim)
+        parent_dim = 0
+        for child_dim in range(ndim):
+            if child_dim != self._extra_dim:
+                result.trans[parent_dim, child_dim] = 1
+                parent_dim += 1
+        return result
+
     def serialize(self, buf: BufferBuilder) -> None:
         code = self._runtime.get_transform_code(self.__class__.__name__)
         buf.pack_32bit_int(code)
@@ -372,6 +389,9 @@ class Project(Transform):
                 child_dim += 1
         return result
 
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        raise NotImplementedError("Not implemented yet")
+
     def serialize(self, buf: BufferBuilder) -> None:
         code = self._runtime.get_transform_code(self.__class__.__name__)
         buf.pack_32bit_int(code)
@@ -460,6 +480,9 @@ class Transpose(Transform):
         for dim in range(ndim):
             result.trans[self._axes[dim], dim] = 1
         return result
+
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        raise NotImplementedError("Not implemented yet")
 
     def serialize(self, buf: BufferBuilder) -> None:
         code = self._runtime.get_transform_code(self.__class__.__name__)
@@ -585,6 +608,9 @@ class Delinearize(Transform):
 
         return result
 
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        raise NotImplementedError("Not implemented yet")
+
     def serialize(self, buf: BufferBuilder) -> None:
         code = self._runtime.get_transform_code(self.__class__.__name__)
         buf.pack_32bit_int(code)
@@ -674,6 +700,11 @@ class TransformStack(TransformStackBase):
         parent = self._parent.get_inverse_transform(transform.M)
         return transform.compose(parent)
 
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        transform = self._transform.get_inverse_color_transform(ndim)
+        parent = self._parent.get_inverse_color_transform(transform.M)
+        return transform.compose(parent)
+
     def stack(self, transform: Transform) -> TransformStack:
         return TransformStack(transform, self)
 
@@ -732,6 +763,9 @@ class IdentityTransform(TransformStackBase):
 
     def get_inverse_transform(self, ndim: int) -> AffineTransform:
         return AffineTransform(ndim, ndim, True)
+
+    def get_inverse_color_transform(self, ndim: int) -> LegionTransform:
+        return LegionTransform(ndim, ndim, True)
 
     def stack(self, transform: Transform) -> TransformStack:
         return TransformStack(transform, self)
