@@ -120,7 +120,6 @@ class TiledSplit(DataSplit):
         local_colors: Iterable[Point],
     ) -> Partition:
         functor = Tiling(
-            _runtime,
             Shape(self.tile_shape),
             Shape(colors),
         )

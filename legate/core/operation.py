@@ -372,7 +372,7 @@ class Task(TaskProtocol):
                 output = self.outputs[self.unbound_outputs[0]]
                 # TODO: need to track partitions for N-D unbound stores
                 if output.ndim == 1:
-                    partition = Weighted(runtime, launch_shape, result)
+                    partition = Weighted(launch_shape, result)
                     output.set_key_partition(partition)
             elif self.can_raise_exception:
                 runtime.record_pending_exception(
@@ -394,7 +394,7 @@ class Task(TaskProtocol):
                 weights = runtime.extract_scalar_with_domain(
                     result, idx, launch_domain
                 )
-                partition = Weighted(runtime, launch_shape, weights)
+                partition = Weighted(launch_shape, weights)
                 output.set_key_partition(partition)
                 idx += 1
             for red_idx in self.scalar_reductions:
@@ -630,9 +630,7 @@ class ManualTask(Operation, Task):
     ) -> None:
         self._check_arg(arg)
         if isinstance(arg, Store):
-            self._input_parts.append(
-                arg.partition(Replicate(self.context.runtime))
-            )
+            self._input_parts.append(arg.partition(Replicate()))
         else:
             self._input_parts.append(arg)
         self._input_projs.append(proj)
@@ -650,9 +648,7 @@ class ManualTask(Operation, Task):
                 return
             if arg.kind is Future:
                 self._scalar_outputs.append(len(self._outputs))
-            self._output_parts.append(
-                arg.partition(Replicate(self.context.runtime))
-            )
+            self._output_parts.append(arg.partition(Replicate()))
         else:
             self._output_parts.append(arg)
         self._output_projs.append(proj)
@@ -667,9 +663,7 @@ class ManualTask(Operation, Task):
         if isinstance(arg, Store):
             if arg.kind is Future:
                 self._scalar_reductions.append(len(self._reductions))
-            self._reduction_parts.append(
-                (arg.partition(Replicate(self.context.runtime)), redop)
-            )
+            self._reduction_parts.append((arg.partition(Replicate()), redop))
         else:
             self._reduction_parts.append((arg, redop))
         self._reduction_projs.append(proj)
@@ -1005,7 +999,7 @@ class Reduce(AutoOperation):
             weights = launcher.execute(launch_domain)
 
             launch_shape = Shape(c + 1 for c in launch_domain.hi)
-            weighted = Weighted(self._runtime, launch_shape, weights)
+            weighted = Weighted(launch_shape, weights)
             output.set_key_partition(weighted)
             opart = output.partition(weighted)
 

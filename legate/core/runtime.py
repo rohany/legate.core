@@ -33,6 +33,7 @@ from . import (
     FutureMap,
     IndexSpace,
     OutputRegion,
+    Partition as LegionPartition,
     Rect,
     Region,
     legate_task_postamble,
@@ -76,14 +77,12 @@ T = TypeVar("T")
 class Field:
     def __init__(
         self,
-        runtime: Runtime,
         region: Region,
         field_id: int,
         dtype: Any,
         shape: Shape,
         own: bool = True,
     ) -> None:
-        self.runtime = runtime
         self.region = region
         self.field_id = field_id
         self.dtype = dtype
@@ -99,12 +98,15 @@ class Field:
     def __del__(self) -> None:
         if self.own:
             # Return our field back to the runtime
-            self.runtime.free_field(
-                self.region,
-                self.field_id,
-                self.dtype,
-                self.shape,
-            )
+            try:
+                get_legate_runtime().free_field(
+                    self.region,
+                    self.field_id,
+                    self.dtype,
+                    self.shape,
+                )
+            except NameError:
+                pass
 
 
 _sizeof_int = ffi.sizeof("int")
@@ -215,6 +217,7 @@ class RegionManager:
         self._region_set: OrderedSet[Region] = OrderedSet()
 
     def destroy(self) -> None:
+        self._runtime = None
         while self._top_regions:
             region = self._top_regions.pop()
             region.destroy()
@@ -289,6 +292,7 @@ class FieldManager:
             self.match_frequency = runtime.max_field_reuse_frequency
 
     def destroy(self) -> None:
+        self.runtime = None
         self.free_fields = deque()
         self.freed_fields = []
 
@@ -398,8 +402,12 @@ class AttachmentManager:
             tuple[Attachable, Union[Detach, IndexDetach]]
         ] = list()
         self._pending_detachments: dict[Future, Attachable] = dict()
+        self._destroyed = False
 
     def destroy(self) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
         gc.collect()
         while self._deferred_detachments:
             self.perform_detachments()
@@ -493,6 +501,8 @@ class AttachmentManager:
         defer: bool = False,
         previously_deferred: bool = False,
     ) -> None:
+        if self._destroyed:
+            return
         # If the detachment was previously deferred, then we don't
         # need to remove the allocation from the map again.
         if not previously_deferred:
@@ -586,6 +596,29 @@ class PartitionManager:
         self._index_partitions: dict[
             tuple[IndexSpace, PartitionBase], IndexPartition
         ] = {}
+        self._storage_partitions: dict[
+            tuple[int, PartitionBase], Optional[LegionPartition]
+        ] = {}
+        self._storage_key_partitions: dict[
+            int, Union[None, PartitionBase]
+        ] = {}
+        self._store_key_partitions: dict[int, Union[None, PartitionBase]] = {}
+
+    def destroy(self) -> None:
+        for _, part, _ in self._index_partitions.keys():
+            part.destroy()
+        for _, part in self._storage_partitions.keys():
+            part.destroy()
+        for part in self._storage_key_partitions.values():
+            if part is not None:
+                part.destroy()
+        for part in self._store_key_partitions.values():
+            if part is not None:
+                part.destroy()
+        del self._index_partitions
+        del self._storage_partitions
+        del self._storage_key_partitions
+        del self._store_key_partitions
 
     def compute_launch_shape(
         self, store: Store, restrictions: tuple[Restriction, ...]
@@ -802,6 +835,55 @@ class PartitionManager:
         assert key not in self._index_partitions
         self._index_partitions[key] = index_partition
 
+    def find_store_key_partition(
+        self,
+        store_id: int,
+    ) -> tuple[Union[None, PartitionBase], bool]:
+        found = store_id in self._store_key_partitions
+        return self._store_key_partitions.get(store_id, None), found
+
+    def record_store_key_partition(
+        self, store_id: int, key_partition: Union[None, PartitionBase]
+    ) -> None:
+        self._store_key_partitions[store_id] = key_partition
+
+    def reset_store_key_partition(self, store_id: int) -> None:
+        del self._store_key_partitions[store_id]
+
+    def find_storage_key_partition(
+        self,
+        storage_id: int,
+    ) -> tuple[Union[None, PartitionBase], bool]:
+        found = storage_id in self._storage_key_partitions
+        return self._storage_key_partitions.get(storage_id, None), found
+
+    def record_storage_key_partition(
+        self, storage_id: int, key_partition: Union[None, PartitionBase]
+    ) -> None:
+        self._storage_key_partitions[storage_id] = key_partition
+
+    def reset_storage_key_partition(self, storage_id: int) -> None:
+        del self._storage_key_partitions[storage_id]
+
+    def find_storage_partition(
+        self, storage_id: int, functor: PartitionBase
+    ) -> tuple[Optional[LegionPartition], bool]:
+        key = (storage_id, functor)
+        found = key in self._storage_partitions
+        if found:
+            return self._storage_partitions[key], found
+        else:
+            return None, found
+
+    def record_storage_partition(
+        self,
+        storage_id: int,
+        functor: PartitionBase,
+        legion_partition: Optional[LegionPartition],
+    ) -> None:
+        key = (storage_id, functor)
+        self._storage_partitions[key] = legion_partition
+
 
 class CommunicatorManager:
     def __init__(self, runtime: Runtime) -> None:
@@ -929,6 +1011,8 @@ class Runtime:
         )
         self._next_projection_id = first_functor_id
         self._next_sharding_id = first_functor_id
+        self._next_store_id = 0
+        self._next_storage_id = 0
         self._registered_projections: dict[
             tuple[int, tuple[ProjExpr, ...]], int
         ] = {}
@@ -1047,6 +1131,7 @@ class Runtime:
         del self._context_list
 
         self._attachment_manager.destroy()
+        self._partition_manager.destroy()
 
         # Remove references to our legion resources so they can be collected
         self.region_managers = {}
@@ -1178,6 +1263,14 @@ class Runtime:
             self.core_library, f"LEGATE_CORE_TRANSFORM_{name.upper()}"
         )
 
+    def get_next_store_id(self):
+        self._next_store_id += 1
+        return self._next_store_id
+
+    def get_next_storage_id(self):
+        self._next_storage_id += 1
+        return self._next_storage_id
+
     def create_future(self, data: Any, size: int) -> Future:
         future = Future()
         future.set_value(self.legion_runtime, data, size)
@@ -1204,9 +1297,11 @@ class Runtime:
             if optimize_scalar and shape is not None and shape.volume() == 1
             else RegionField
         )
-        storage = Storage(self, shape, 0, dtype, data=data, kind=kind)
+        storage = Storage(
+            self.get_next_storage_id(), shape, 0, dtype, data=data, kind=kind
+        )
         return Store(
-            self,
+            self.get_next_store_id(),
             dtype,
             storage,
             IdentityTransform(),
@@ -1241,8 +1336,8 @@ class Runtime:
         field_id = None
         field_mgr = self.find_or_create_field_manager(shape, dtype)
         region, field_id = field_mgr.allocate_field()
-        field = Field(self, region, field_id, dtype, shape)
-        return RegionField(self, region, field, shape)
+        field = Field(region, field_id, dtype, shape)
+        return RegionField(region, field, shape)
 
     def free_field(
         self, region: Region, field_id: int, dtype: Any, shape: Shape
@@ -1253,7 +1348,7 @@ class Runtime:
             return
         # Now save it in our data structure for free fields eligible for reuse
         key = (shape, dtype)
-        if self.field_managers is not None:
+        if self.field_managers is not None and key in self.field_managers:
             self.field_managers[key].free_field(region, field_id)
 
     def import_output_region(
@@ -1265,7 +1360,6 @@ class Runtime:
         region_mgr = self.find_or_create_region_manager(shape)
         region_mgr.import_region(region)
         field = Field(
-            self,
             region,
             field_id,
             dtype,
@@ -1275,7 +1369,7 @@ class Runtime:
 
         self.find_or_create_field_manager(shape, dtype)
 
-        return RegionField(self, region, field, shape)
+        return RegionField(region, field, shape)
 
     def create_output_region(
         self, fspace: FieldSpace, fields: FieldListLike, ndim: int

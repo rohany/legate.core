@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from .context import Context
     from .launcher import Proj
     from .projection import ProjFn
-    from .runtime import Field, Runtime
+    from .runtime import AttachmentManager, Field, PartitionManager, Runtime
     from .transform import TransformStackBase
 
 from math import prod
@@ -132,15 +132,11 @@ Attachable = Union[memoryview, DistributedAllocation]
 class RegionField:
     def __init__(
         self,
-        runtime: Runtime,
         region: Region,
         field: Field,
         shape: Shape,
         parent: Optional[RegionField] = None,
     ) -> None:
-        self.runtime = runtime
-        self.attachment_manager = runtime.attachment_manager
-        self.partition_manager = runtime.partition_manager
         self.region = region
         self.field = field
         self.shape = shape
@@ -155,6 +151,16 @@ class RegionField:
         self.physical_region_mapped = False
 
         self._partitions: dict[PartitionBase, LegionPartition] = {}
+
+    @property
+    def runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
+
+    @property
+    def attachment_manager(self) -> AttachmentManager:
+        return self.runtime.attachment_manager
 
     def __del__(self) -> None:
         if self.attached_alloc is not None:
@@ -411,6 +417,7 @@ class RegionField:
     def get_child(
         self, functor: Tiling, color: Shape, complete: bool = False
     ) -> RegionField:
+        assert isinstance(functor, Tiling)
         if functor in self._partitions:
             partition = self._partitions[functor]
         else:
@@ -421,7 +428,6 @@ class RegionField:
 
         child_region = partition.get_child(Point(color))
         return RegionField(
-            self.runtime,
             child_region,
             self.field,
             functor.get_subregion_size(self.shape, color),
@@ -432,13 +438,11 @@ class RegionField:
 class StoragePartition:
     def __init__(
         self,
-        runtime: Runtime,
         level: int,
         parent: Storage,
         partition: PartitionBase,
         complete: bool = False,
     ) -> None:
-        self._runtime = runtime
         self._level = level
         self._parent = parent
         self._partition = partition
@@ -446,6 +450,12 @@ class StoragePartition:
         self._child_data: dict[Shape, RegionField] = {}
         self._child_sizes: dict[Shape, Shape] = {}
         self._child_offsets: dict[Shape, Shape] = {}
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     @property
     def parent(self) -> Storage:
@@ -467,7 +477,7 @@ class StoragePartition:
         extents = self.get_child_size(color)
         offsets = self.get_child_offsets(color)
         return Storage(
-            self._runtime,
+            self._runtime.get_next_storage_id(),
             extents,
             self._level + 1,
             self._parent.dtype,
@@ -529,7 +539,7 @@ class StoragePartition:
 class Storage:
     def __init__(
         self,
-        runtime: Runtime,
+        unique_id: int,
         extents: Optional[Shape],
         level: int,
         dtype: Any,
@@ -546,9 +556,7 @@ class Storage:
         )
         assert not isinstance(data, Future) or parent is None
         assert parent is None or color is not None
-        self._runtime = runtime
-        self._attachment_manager = runtime.attachment_manager
-        self._partition_manager = runtime.partition_manager
+        self._unique_id = unique_id
         self._extents = extents
         self._offsets = offsets
         self._level = level
@@ -557,8 +565,6 @@ class Storage:
         self._kind = kind
         self._parent = parent
         self._color = color
-        self._partitions: dict[PartitionBase, Optional[LegionPartition]] = {}
-        self._key_partition: Union[None, PartitionBase] = None
 
         if self._offsets is None and self._extents is not None:
             self._offsets = Shape((0,) * self._extents.ndim)
@@ -572,6 +578,20 @@ class Storage:
 
     def __repr__(self) -> str:
         return str(self)
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
+
+    @property
+    def _attachment_manager(self) -> AttachmentManager:
+        return self._runtime.attachment_manager
+
+    @property
+    def _partition_manager(self) -> PartitionManager:
+        return self._runtime.partition_manager
 
     @property
     def extents(self) -> Shape:
@@ -750,10 +770,9 @@ class Storage:
             color = Shape((0,) * shape.ndim)
             complete = False
 
-        tiling = Tiling(self._runtime, tile_shape, color_shape, offsets)
+        tiling = Tiling(tile_shape, color_shape, offsets)
         # We create a slice partition directly off of the root
         partition = StoragePartition(
-            self._runtime,
             1,
             self.get_root(),
             tiling,
@@ -764,7 +783,7 @@ class Storage:
     def partition(self, partition: PartitionBase) -> StoragePartition:
         complete = partition.is_complete_for(self.extents, self.offsets)
         return StoragePartition(
-            self._runtime, self._level + 1, self, partition, complete=complete
+            self._level + 1, self, partition, complete=complete
         )
 
     def get_inline_allocation(
@@ -781,21 +800,28 @@ class Storage:
     def find_key_partition(
         self, restrictions: tuple[Restriction, ...]
     ) -> Optional[PartitionBase]:
+        (
+            key_partition,
+            found,
+        ) = self._partition_manager.find_storage_key_partition(self._unique_id)
         if (
-            self._key_partition is not None
-            and self._key_partition.satisfies_restriction(restrictions)
+            found
+            and key_partition is not None
+            and key_partition.satisfies_restriction(restrictions)
         ):
-            return self._key_partition
+            return key_partition
         elif self._parent is not None:
             return self._parent.find_key_partition(restrictions)
         else:
             return None
 
     def set_key_partition(self, partition: PartitionBase) -> None:
-        self._key_partition = partition
+        self._partition_manager.record_storage_key_partition(
+            self._unique_id, partition
+        )
 
     def reset_key_partition(self) -> None:
-        self._key_partition = None
+        self._partition_manager.reset_storage_key_partition(self._unique_id)
 
     def find_or_create_legion_partition(
         self,
@@ -810,8 +836,16 @@ class Storage:
         assert isinstance(self.data, RegionField)
         assert color_shape is None or color_transform is not None
 
-        if functor in self._partitions and color_shape is None:
-            return self._partitions[functor]
+        if color_shape is None:
+            part, found = self._partition_manager.find_storage_partition(
+                self._unique_id, functor
+            )
+        else:
+            part = None
+            found = False
+
+        if found:
+            return part
 
         part = functor.construct(
             self.data.region,
@@ -819,8 +853,11 @@ class Storage:
             color_shape=color_shape,
             color_transform=color_transform,
         )
+
         if color_shape is None:
-            self._partitions[functor] = part
+            self._partition_manager.record_storage_partition(
+                self._unique_id, functor, part
+            )
 
         return part
 
@@ -828,15 +865,19 @@ class Storage:
 class StorePartition:
     def __init__(
         self,
-        runtime: Runtime,
         store: Store,
         partition: PartitionBase,
         storage_partition: StoragePartition,
     ) -> None:
-        self._runtime = runtime
         self._store = store
         self._partition = partition
         self._storage_partition = storage_partition
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     @property
     def store(self) -> Store:
@@ -856,10 +897,10 @@ class StorePartition:
         child_transform = self.transform
         for dim, offset in enumerate(child_storage.offsets):
             child_transform = TransformStack(
-                Shift(self._runtime, dim, -offset), child_transform
+                Shift(dim, -offset), child_transform
             )
         return Store(
-            self._runtime,
+            self._runtime.get_next_store_id(),
             self._store.type,
             child_storage,
             child_transform,
@@ -891,7 +932,7 @@ class StorePartition:
 class Store:
     def __init__(
         self,
-        runtime: Runtime,
+        store_id: int,
         dtype: _Dtype,
         storage: Storage,
         transform: TransformStackBase,
@@ -921,14 +962,12 @@ class Store:
 
         """
         assert isinstance(shape, Shape) or shape is None
-        self._runtime = runtime
-        self._partition_manager = runtime.partition_manager
+        self._unique_id = store_id
         self._shape = shape
         self._ndim = ndim
         self._dtype = dtype
         self._storage = storage
         self._transform = transform
-        self._key_partition: Union[None, PartitionBase] = None
         # This is a cache for the projection functor id
         # when no custom functor is given
         self._projection: Union[None, int] = None
@@ -1039,6 +1078,16 @@ class Store:
     def bump_version(self):
         self._version += 1
 
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
+
+    @property
+    def _partition_manager(self) -> PartitionManager:
+        return self._runtime.partition_manager
+
     def attach_external_allocation(
         self, context: Context, alloc: Attachable, share: bool
     ) -> None:
@@ -1080,6 +1129,7 @@ class Store:
     def __str__(self) -> str:
         return (
             f"Store("
+            f"id: {self._unique_id}, "
             f"shape: {self._shape}, "
             f"ndim: {self._ndim}, "
             f"type: {self._dtype}, "
@@ -1100,13 +1150,13 @@ class Store:
                 f"{self.ndim}-D store"
             )
 
-        transform = Promote(self._runtime, extra_dim, dim_size)
+        transform = Promote(extra_dim, dim_size)
         old_shape = self.shape
         shape = transform.compute_shape(old_shape)
         if old_shape == shape:
             return self
         return Store(
-            self._runtime,
+            self._runtime.get_next_store_id(),
             self._dtype,
             self._storage,
             TransformStack(transform, self._transform),
@@ -1130,7 +1180,7 @@ class Store:
                 f"{index} for a store of shape {old_shape}"
             )
 
-        transform = Project(self._runtime, dim, index)
+        transform = Project(dim, index)
         shape = transform.compute_shape(old_shape)
         if old_shape == shape:
             return self
@@ -1146,7 +1196,7 @@ class Store:
                 self._transform.invert_point(offsets),
             )
         return Store(
-            self._runtime,
+            self._runtime.get_next_store_id(),
             self._dtype,
             storage,
             TransformStack(transform, self._transform),
@@ -1193,12 +1243,10 @@ class Store:
         transform = (
             self._transform
             if start == 0
-            else TransformStack(
-                Shift(self._runtime, dim, -start), self._transform
-            )
+            else TransformStack(Shift(dim, -start), self._transform)
         )
         return Store(
-            self._runtime,
+            self._runtime.get_next_store_id(),
             self._dtype,
             storage,
             transform,
@@ -1223,10 +1271,10 @@ class Store:
         if all(idx == val for idx, val in enumerate(axes)):
             return self
 
-        transform = Transpose(self._runtime, axes)
+        transform = Transpose(axes)
         shape = transform.compute_shape(self.shape)
         return Store(
-            self._runtime,
+            self._runtime.get_next_store_id(),
             self._dtype,
             self._storage,
             TransformStack(transform, self._transform),
@@ -1244,7 +1292,7 @@ class Store:
         if len(shape) == 1:
             return self
         s = Shape(shape)
-        transform = Delinearize(self._runtime, dim, s)
+        transform = Delinearize(dim, s)
         old_shape = self.shape
         if old_shape[dim] != s.volume():
             raise ValueError(
@@ -1253,7 +1301,7 @@ class Store:
             )
         new_shape = transform.compute_shape(old_shape)
         return Store(
-            self._runtime,
+            self._runtime.get_next_store_id(),
             self._dtype,
             self._storage,
             TransformStack(transform, self._transform),
@@ -1287,11 +1335,16 @@ class Store:
 
         restrictions = self.find_restrictions()
 
+        (
+            key_partition,
+            found,
+        ) = self._partition_manager.find_store_key_partition(self._unique_id)
         if (
-            self._key_partition is not None
-            and self._key_partition.satisfies_restriction(restrictions)
+            found
+            and key_partition is not None
+            and key_partition.satisfies_restriction(restrictions)
         ):
-            return self._key_partition
+            return key_partition
 
         return None
 
@@ -1301,7 +1354,9 @@ class Store:
         return (part is not None) and (part.even or self._transform.bottom)
 
     def set_key_partition(self, partition: PartitionBase) -> None:
-        self._key_partition = partition
+        self._partition_manager.record_store_key_partition(
+            self._unique_id, partition
+        )
         # We also update the storage's key partition for other stores
         # sharing the same storage
         self._storage.set_key_partition(
@@ -1309,20 +1364,26 @@ class Store:
         )
 
     def reset_key_partition(self) -> None:
+        self._partition_manager.reset_store_key_partition(self._unique_id)
         self._storage.reset_key_partition()
 
     def compute_key_partition(
         self, restrictions: tuple[Restriction, ...]
     ) -> PartitionBase:
+        (
+            key_partition,
+            found,
+        ) = self._partition_manager.find_store_key_partition(self._unique_id)
         if (
-            self._key_partition is not None
-            and self._key_partition.satisfies_restriction(restrictions)
+            found
+            and key_partition is not None
+            and key_partition.satisfies_restriction(restrictions)
         ):
-            return self._key_partition
+            return key_partition
 
         # If this is effectively a scalar store, we don't need to partition it
         if self.kind is Future or self.ndim == 0:
-            return Replicate(self._runtime)
+            return Replicate()
 
         # We need the transformations to be convertible so that we can map
         # the storage partition to this store's coordinate space
@@ -1342,12 +1403,12 @@ class Store:
                 restrictions,
             )
             if launch_shape is None:
-                partition = Replicate(self._runtime)
+                partition = Replicate()
             else:
                 tile_shape = self._partition_manager.compute_tile_shape(
                     self.shape, launch_shape
                 )
-                partition = Tiling(self._runtime, tile_shape, launch_shape)
+                partition = Tiling(tile_shape, launch_shape)
             return partition
 
     def compute_projection(
@@ -1415,14 +1476,11 @@ class Store:
         storage_partition = self._storage.partition(
             self.invert_partition(partition),
         )
-        return StorePartition(
-            self._runtime, self, partition, storage_partition
-        )
+        return StorePartition(self, partition, storage_partition)
 
     # TODO (rohany): Hacking...
     def direct_partition(self, partition: PartitionBase) -> StorePartition:
         return StorePartition(
-            self._runtime,
             self,
             partition,
             self._storage.partition(partition),
@@ -1436,5 +1494,5 @@ class Store:
         if not isinstance(tile_shape, Shape):
             tile_shape = Shape(tile_shape)
         launch_shape = (self.shape + tile_shape - 1) // tile_shape
-        partition = Tiling(self._runtime, tile_shape, launch_shape)
+        partition = Tiling(tile_shape, launch_shape)
         return self.partition(partition)

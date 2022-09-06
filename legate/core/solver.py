@@ -215,11 +215,11 @@ class Partitioner:
                 continue
 
             if store.kind is Future:
-                partitions[unknown] = Replicate(self._runtime)
+                partitions[unknown] = Replicate()
             else:
                 cls = constraints.find(unknown)
                 for to_align in cls:
-                    partitions[to_align] = Replicate(self._runtime)
+                    partitions[to_align] = Replicate()
 
         return unknowns.remove_all(to_remove)
 
@@ -246,7 +246,7 @@ class Partitioner:
 
             fspace = self._runtime.create_field_space()
             for to_align in cls:
-                partitions[unknown] = Replicate(self._runtime)
+                partitions[unknown] = Replicate()
                 fspaces[unknown] = fspace
 
         unbound_ndims = set(unknown.store.ndim for unknown in to_remove)

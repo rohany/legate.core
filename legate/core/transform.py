@@ -102,10 +102,15 @@ class Transform(TransformProto, Protocol):
 
 
 class Shift(Transform):
-    def __init__(self, runtime: Runtime, dim: int, offset: int) -> None:
-        self._runtime = runtime
+    def __init__(self, dim: int, offset: int) -> None:
         self._dim = dim
         self._offset = offset
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     def compute_shape(self, shape: Shape) -> Shape:
         return shape
@@ -133,7 +138,6 @@ class Shift(Transform):
             offset = partition.offset[self._dim] - self._offset
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape,
                 partition.color_shape,
                 partition.offset.update(self._dim, offset),
@@ -163,7 +167,6 @@ class Shift(Transform):
             offset = partition.offset[self._dim] + self._offset
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape,
                 partition.color_shape,
                 partition.offset.update(self._dim, offset),
@@ -194,12 +197,15 @@ class Shift(Transform):
 
 
 class Promote(Transform):
-    def __init__(
-        self, runtime: Runtime, extra_dim: int, dim_size: int
-    ) -> None:
-        self._runtime = runtime
+    def __init__(self, extra_dim: int, dim_size: int) -> None:
         self._extra_dim = extra_dim
         self._dim_size = dim_size
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     def compute_shape(self, shape: Shape) -> Shape:
         return shape.insert(self._extra_dim, self._dim_size)
@@ -229,7 +235,6 @@ class Promote(Transform):
         if isinstance(partition, Tiling):
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape.drop(self._extra_dim),
                 partition.color_shape.drop(self._extra_dim),
                 partition.offset.drop(self._extra_dim),
@@ -277,7 +282,6 @@ class Promote(Transform):
         if isinstance(partition, Tiling):
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape.insert(self._extra_dim, self._dim_size),
                 partition.color_shape.insert(self._extra_dim, 1),
                 partition.offset.insert(self._extra_dim, 0),
@@ -348,10 +352,15 @@ class Promote(Transform):
 
 
 class Project(Transform):
-    def __init__(self, runtime: Runtime, dim: int, index: int) -> None:
-        self._runtime = runtime
+    def __init__(self, dim: int, index: int) -> None:
         self._dim = dim
         self._index = index
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     def compute_shape(self, shape: Shape) -> Shape:
         return shape.drop(self._dim)
@@ -378,7 +387,6 @@ class Project(Transform):
         if isinstance(partition, Tiling):
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape.insert(self._dim, 1),
                 partition.color_shape.insert(self._dim, 1),
                 partition.offset.insert(self._dim, self._index),
@@ -410,7 +418,6 @@ class Project(Transform):
         if isinstance(partition, Tiling):
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape.drop(self._dim),
                 partition.color_shape.drop(self._dim),
                 partition.offset.drop(self._dim),
@@ -449,10 +456,15 @@ class Project(Transform):
 
 
 class Transpose(Transform):
-    def __init__(self, runtime: Runtime, axes: tuple[int, ...]) -> None:
-        self._runtime = runtime
+    def __init__(self, axes: tuple[int, ...]) -> None:
         self._axes = axes
         self._inverse = tuple(np.argsort(self._axes))
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     def compute_shape(self, shape: Shape) -> Shape:
         new_shape = Shape(tuple(shape[dim] for dim in self._axes))
@@ -480,7 +492,6 @@ class Transpose(Transform):
         if isinstance(partition, Tiling):
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape.map(self._inverse),
                 partition.color_shape.map(self._inverse),
                 partition.offset.map(self._inverse),
@@ -509,7 +520,6 @@ class Transpose(Transform):
         if isinstance(partition, Tiling):
             assert partition.color_shape is not None
             return Tiling(
-                self._runtime,
                 partition.tile_shape.map(self._axes),
                 partition.color_shape.map(self._axes),
                 partition.offset.map(self._axes),
@@ -542,11 +552,16 @@ class Transpose(Transform):
 
 
 class Delinearize(Transform):
-    def __init__(self, runtime: Runtime, dim: int, shape: Shape) -> None:
-        self._runtime = runtime
+    def __init__(self, dim: int, shape: Shape) -> None:
         self._dim = dim
         self._shape = Shape(shape)
         self._strides = self._shape.strides()
+
+    @property
+    def _runtime(self) -> Runtime:
+        from .runtime import get_legate_runtime
+
+        return get_legate_runtime()
 
     def compute_shape(self, shape: Shape) -> Shape:
         return shape.replace(self._dim, self._shape)
@@ -601,7 +616,6 @@ class Delinearize(Transform):
                 new_offset = new_offset.insert(self._dim, dim_offset)
 
                 return Tiling(
-                    self._runtime,
                     new_tile_shape,
                     new_color_shape,
                     new_offset,
