@@ -592,10 +592,10 @@ class AttachmentManager:
 class PartitionManager:
     def __init__(self, runtime: Runtime) -> None:
         self._runtime = runtime
-        self._num_pieces = runtime.core_context.get_tunable(
-            runtime.core_library.LEGATE_CORE_TUNABLE_NUM_PIECES,
-            ty.int32,
-        )
+        # self._num_pieces = runtime.core_context.get_tunable(
+        #     runtime.core_library.LEGATE_CORE_TUNABLE_NUM_PIECES,
+        #     ty.int32,
+        # )
         self._min_shard_volume = runtime.core_context.get_tunable(
             runtime.core_library.LEGATE_CORE_TUNABLE_MIN_SHARD_VOLUME,
             ty.int64,
@@ -636,6 +636,10 @@ class PartitionManager:
         self._index_partitions: dict[
             tuple[IndexSpace, PartitionBase, Optional[Shape]], IndexPartition
         ] = {}
+
+    @property
+    def _num_pieces(self) -> int:
+        return self._runtime.num_procs
 
     def compute_launch_shape(
         self, store: Store, restrictions: tuple[Restriction, ...]
@@ -951,6 +955,9 @@ class Runtime:
                 ty.int32,
             )
         )
+        # TODO (rohany): Comment this...
+        self._use_gpus = True
+
         self._num_nodes = int(
             self._core_context.get_tunable(
                 legion.LEGATE_CORE_TUNABLE_NUM_NODES,
@@ -1062,9 +1069,26 @@ class Runtime:
     def num_omps(self) -> int:
         return self._num_omps
 
+    # TODO (rohany): We can change the name here, but a method like this can
+    #  be part of a context manager that interacts with the runtime.
+    def set_use_gpus(self, use: bool) -> None:
+        self._use_gpus = use
+
     @property
     def num_gpus(self) -> int:
-        return self._num_gpus
+        # If we're in a phase where the user has requested not to use GPUs,
+        # then we'll treat the system as not having any GPUs right now.
+        if self._use_gpus:
+            return self._num_gpus
+        return 0
+
+    @property
+    def num_procs(self) -> int:
+        if self.num_gpus > 0:
+            return self.num_gpus
+        if self.num_omps > 0:
+            return self.num_omps
+        return self.num_cpus
 
     @property
     def attachment_manager(self) -> AttachmentManager:
