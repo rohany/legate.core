@@ -611,7 +611,10 @@ class PartitionManager:
             tuple[int, ...], Optional[tuple[int, ...]]
         ] = {}
         factors = list()
-        pieces = self._num_pieces
+        # The number of pieces that we consider can now change between the
+        # number of CPUs and GPUs, so collect prime factors for the most
+        # possible number of pieces.
+        pieces = max(self._runtime.num_cpus, self._runtime.num_omps, self._runtime.num_gpus)
         while pieces % 2 == 0:
             factors.append(2)
             pieces = pieces // 2
@@ -698,6 +701,7 @@ class PartitionManager:
             temp_dims = temp_dims + (dim,)
             volume *= shape[dim]
         # Figure out how many shards we can make with this array
+        volume = volume
         max_pieces = (
             volume + self._min_shard_volume - 1
         ) // self._min_shard_volume
