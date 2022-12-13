@@ -31,11 +31,7 @@ namespace legate {
 namespace mapping {
 
 class InstanceManager;
-
-enum class Strictness : bool {
-  strict = true,
-  hint   = false,
-};
+class Machine;
 
 class BaseMapper : public Legion::Mapping::Mapper, public LegateMapper {
  public:
@@ -48,8 +44,6 @@ class BaseMapper : public Legion::Mapping::Mapper, public LegateMapper {
 
  protected:
   // Start-up methods
-  static Legion::AddressSpaceID get_local_node(void);
-  static size_t get_total_nodes(Legion::Machine m);
   std::string create_name(Legion::AddressSpace node) const;
   std::string create_logger_name() const;
 
@@ -256,7 +250,6 @@ class BaseMapper : public Legion::Mapping::Mapper, public LegateMapper {
                                   const MapperTaskResult& result) override;
 
  protected:
-  Legion::Memory get_target_memory(Legion::Processor proc, StoreTarget target);
   using OutputMap =
     std::map<const Legion::RegionRequirement*, std::vector<Legion::Mapping::PhysicalInstance>*>;
   void map_legate_stores(const Legion::Mapping::MapperContext ctx,
@@ -281,55 +274,24 @@ class BaseMapper : public Legion::Mapping::Mapper, public LegateMapper {
                              const Legion::Mapping::PhysicalInstance& target,
                              const std::vector<Legion::Mapping::PhysicalInstance>& sources,
                              std::deque<Legion::Mapping::PhysicalInstance>& ranking);
+  Legion::ShardingID find_mappable_sharding_functor_id(const Legion::Mappable& mappable);
 
  protected:
   bool has_variant(const Legion::Mapping::MapperContext ctx,
                    const Legion::Task& task,
-                   Legion::Processor::Kind kind);
+                   TaskTarget target);
   std::optional<Legion::VariantID> find_variant(const Legion::Mapping::MapperContext ctx,
                                                 const Legion::Task& task,
                                                 Legion::Processor::Kind kind);
 
- private:
-  void generate_prime_factors();
-  void generate_prime_factor(const std::vector<Legion::Processor>& processors,
-                             Legion::Processor::Kind kind);
-
  protected:
-  template <typename Functor>
-  decltype(auto) dispatch(TaskTarget target, Functor functor)
-  {
-    switch (target) {
-      case TaskTarget::CPU: return functor(local_cpus);
-      case TaskTarget::GPU: return functor(local_gpus);
-      case TaskTarget::OMP: return functor(local_omps);
-    }
-    assert(false);
-    return functor(local_cpus);
-  }
-  template <typename Functor>
-  decltype(auto) dispatch(Legion::Processor::Kind kind, Functor functor)
-  {
-    switch (kind) {
-      case Legion::Processor::LOC_PROC: return functor(local_cpus);
-      case Legion::Processor::TOC_PROC: return functor(local_gpus);
-      case Legion::Processor::OMP_PROC: return functor(local_omps);
-      default: LEGATE_ABORT;
-    }
-    assert(false);
-    return functor(local_cpus);
-  }
-
- protected:
-  const std::vector<int32_t> get_processor_grid(Legion::Processor::Kind kind, int32_t ndim);
   void slice_auto_task(const Legion::Mapping::MapperContext ctx,
                        const Legion::Task& task,
+                       const Span<const Legion::Processor>& avail_procs,
+                       uint32_t size,
+                       uint32_t offset,
                        const SliceTaskInput& input,
                        SliceTaskOutput& output);
-  void slice_manual_task(const Legion::Mapping::MapperContext ctx,
-                         const Legion::Task& task,
-                         const SliceTaskInput& input,
-                         SliceTaskOutput& output);
 
  protected:
   Legion::ShardingID find_sharding_functor_by_key_store_projection(
@@ -346,21 +308,12 @@ class BaseMapper : public Legion::Mapping::Mapper, public LegateMapper {
 
  public:
   Legion::Runtime* const legion_runtime;
-  const Legion::Machine machine;
+  const Legion::Machine legion_machine;
   const LibraryContext context;
-  const Legion::AddressSpace local_node;
-  const size_t total_nodes;
-  const std::string mapper_name;
   Legion::Logger logger;
 
- protected:
-  std::vector<Legion::Processor> local_cpus;
-  std::vector<Legion::Processor> local_gpus;
-  std::vector<Legion::Processor> local_omps;  // OpenMP processors
- protected:
-  Legion::Memory local_system_memory, local_zerocopy_memory;
-  std::map<Legion::Processor, Legion::Memory> local_frame_buffers;
-  std::map<Legion::Processor, Legion::Memory> local_numa_domains;
+ private:
+  std::string mapper_name;
 
  protected:
   using VariantCacheKey = std::pair<Legion::TaskID, Legion::Processor::Kind>;
@@ -368,16 +321,7 @@ class BaseMapper : public Legion::Mapping::Mapper, public LegateMapper {
 
  protected:
   InstanceManager* local_instances;
-
- protected:
-  // Used for n-D cyclic distribution
-  std::map<Legion::Processor::Kind, std::vector<int32_t>> all_factors;
-  std::map<std::pair<Legion::Processor::Kind, int32_t>, std::vector<int32_t>> proc_grids;
-
- protected:
-  // These are used for computing sharding functions
-  std::map<Legion::IndexPartition, unsigned> partition_color_space_dims;
-  std::map<Legion::IndexSpace, unsigned> index_color_dims;
+  std::unique_ptr<Machine> machine;
 };
 
 }  // namespace mapping

@@ -17,8 +17,8 @@
 namespace legate {
 
 template <typename Deserializer>
-BaseDeserializer<Deserializer>::BaseDeserializer(const int8_t* args, size_t arglen)
-  : args_(Span<const int8_t>(args, arglen))
+BaseDeserializer<Deserializer>::BaseDeserializer(const void* args, size_t arglen)
+  : args_(Span<const int8_t>(static_cast<const int8_t*>(args), arglen))
 {
 }
 
@@ -35,6 +35,32 @@ void BaseDeserializer<Deserializer>::_unpack(Scalar& value)
   auto code  = unpack<LegateTypeCode>();
   value      = Scalar(tuple, code, args_.ptr());
   args_      = args_.subspan(value.size());
+}
+
+template <typename Deserializer>
+void BaseDeserializer<Deserializer>::_unpack(mapping::TaskTarget& value)
+{
+  value = static_cast<mapping::TaskTarget>(unpack<int32_t>());
+}
+
+template <typename Deserializer>
+void BaseDeserializer<Deserializer>::_unpack(mapping::ProcessorRange& value)
+{
+  value.per_node_count = unpack<uint32_t>();
+  value.lo             = unpack<uint32_t>();
+  value.hi             = unpack<uint32_t>();
+}
+
+template <typename Deserializer>
+void BaseDeserializer<Deserializer>::_unpack(mapping::MachineDesc& value)
+{
+  value.preferred_target = unpack<mapping::TaskTarget>();
+  auto num_ranges        = unpack<uint32_t>();
+  for (uint32_t idx = 0; idx < num_ranges; ++idx) {
+    auto kind  = unpack<mapping::TaskTarget>();
+    auto range = unpack<mapping::ProcessorRange>();
+    if (!range.empty()) value.processor_ranges.insert({kind, range});
+  }
 }
 
 template <typename Deserializer>

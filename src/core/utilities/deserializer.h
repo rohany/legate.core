@@ -23,6 +23,7 @@
 #include "core/comm/communicator.h"
 #include "core/data/scalar.h"
 #include "core/data/store.h"
+#include "core/mapping/machine.h"
 #include "core/mapping/operation.h"
 #include "core/utilities/span.h"
 #include "core/utilities/type_traits.h"
@@ -34,7 +35,7 @@ namespace legate {
 template <typename Deserializer>
 class BaseDeserializer {
  public:
-  BaseDeserializer(const int8_t* args, size_t arglen);
+  BaseDeserializer(const void* args, size_t arglen);
 
  public:
   template <typename T>
@@ -60,18 +61,28 @@ class BaseDeserializer {
     auto size = unpack<uint32_t>();
     for (uint32_t idx = 0; idx < size; ++idx) values.push_back(unpack<T>());
   }
+  template <typename T1, typename T2>
+  void _unpack(std::pair<T1, T2>& values)
+  {
+    values.first  = unpack<T1>();
+    values.second = unpack<T2>();
+  }
 
  public:
   void _unpack(LegateTypeCode& value);
   void _unpack(Scalar& value);
+  void _unpack(mapping::TaskTarget& value);
+  void _unpack(mapping::ProcessorRange& value);
+  void _unpack(mapping::MachineDesc& value);
+
+ public:
+  Span<const int8_t> current_args() const { return args_; }
 
  protected:
   std::shared_ptr<TransformStack> unpack_transform();
 
  protected:
   bool first_task_;
-
- private:
   Span<const int8_t> args_;
 };
 
@@ -97,6 +108,14 @@ class TaskDeserializer : public BaseDeserializer<TaskDeserializer> {
 };
 
 namespace mapping {
+
+class MapperDataDeserializer : public BaseDeserializer<MapperDataDeserializer> {
+ public:
+  MapperDataDeserializer(const Legion::Mappable* mappable);
+
+ public:
+  using BaseDeserializer::_unpack;
+};
 
 class TaskDeserializer : public BaseDeserializer<TaskDeserializer> {
  public:
@@ -125,8 +144,7 @@ class CopyDeserializer : public BaseDeserializer<CopyDeserializer> {
   using ReqsRef      = std::reference_wrapper<const Requirements>;
 
  public:
-  CopyDeserializer(const void* args,
-                   size_t arglen,
+  CopyDeserializer(const Legion::Copy* copy,
                    std::vector<ReqsRef>&& all_requirements,
                    Legion::Mapping::MapperRuntime* runtime,
                    Legion::Mapping::MapperContext context);
