@@ -19,6 +19,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Type, Union
 
 from . import (
+    BufferBuilder,
     FutureMap,
     IndexPartition,
     PartitionByDomain,
@@ -44,6 +45,13 @@ if TYPE_CHECKING:
 
 
 RequirementType = Union[Type[Broadcast], Type[Partition]]
+
+
+def _mapper_argument() -> bytes:
+    argbuf = BufferBuilder()
+    runtime.machine.pack(argbuf)
+    argbuf.pack_32bit_uint(runtime.get_sharding(0))
+    return argbuf.get_string()
 
 
 class PartitionBase(ABC):
@@ -520,6 +528,7 @@ class ImagePartition(PartitionBase):
                 source_part,
                 source_field.field_id,
                 mapper=self._mapper,
+                mapper_arg=_mapper_argument(),
             )
         else:
             functor = PartitionByImage(  # type: ignore
@@ -527,6 +536,7 @@ class ImagePartition(PartitionBase):
                 source_part,
                 source_field.field_id,
                 mapper=self._mapper,
+                mapper_arg=_mapper_argument(),
             )
         index_partition = runtime.partition_manager.find_index_partition(
             region.index_space, self
@@ -675,6 +685,7 @@ class PreimagePartition(PartitionBase):
             source_region,
             source_field,
             mapper=self._mapper,
+            mapper_arg=_mapper_argument(),
         )
         index_partition = runtime.partition_manager.find_index_partition(
             region.index_space, self
