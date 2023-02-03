@@ -67,7 +67,9 @@ class Partition:
                 index_partition.handle,
             )
         self.handle = handle
-        self.children: dict[Point, Region] = dict()
+        # self.children: dict[Point, Region] = dict()
+        import weakref
+        self.children = weakref.WeakValueDictionary()
 
     @property
     def color_space(self) -> IndexSpace:
@@ -185,14 +187,16 @@ class IndexPartition:
         else:
             self.functor = None
         self.handle = handle
-        self.children: dict[Point, IndexSpace] = dict()
+        # self.children: dict[Point, IndexSpace] = dict()
+        import weakref
+        self.children = weakref.WeakValueDictionary()
         self.owned = owned
         if owned and not self.parent.owned:
             raise ValueError(
                 "IndexPartition can only own its handle if "
                 "the parent IndexSpace also owns its handle"
             )
-        self.parent.add_child(self)
+        # self.parent.add_child(self)
 
     def __del__(self) -> None:
         # Record a pending deletion if this task is still executing
@@ -231,11 +235,13 @@ class IndexPartition:
             Whether to recursively destroy down the index space tree
         """
         if not self.owned:
+            print("Failed partition collection due to non-ownership.")
             return
         self.owned = False
         # Check to see if we're still inside the context of the task
         # If not then we just need to leak this index partition
         if self.context not in _pending_unordered:
+            print("Failed partition collection due to not context.")
             return
         if unordered:
             # See if we have a _logical_handle from an OutputRegion

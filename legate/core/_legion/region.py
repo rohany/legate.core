@@ -128,12 +128,16 @@ class Region:
         if self.parent is not None:
             raise RuntimeError("Only root Region objects can be destroyed")
         if not self.owned:
+            print("Failed deletion for Region due to non-ownership")
             return
         self.owned = False
         # Check to see if we're still in the context of our task
         # If not we need to leak this region
         if self.context not in _pending_unordered:
+            print("Failed deletion for Region due to no context")
             return
+        # # Unset children?
+        # self.children = None
         if unordered:
             _pending_unordered[self.context].append((self.handle, type(self)))
         else:

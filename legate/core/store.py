@@ -119,7 +119,10 @@ class RegionField:
         self.physical_region_refs = 0
         self.physical_region_mapped = False
 
-        self._partitions: dict[Tiling, LegionPartition] = {}
+        # self._partitions: dict[Tiling, LegionPartition] = {}
+        from lru import LRU
+        self._partitions = LRU(10)
+
 
     def __del__(self) -> None:
         if self.attached_alloc is not None:
@@ -386,6 +389,18 @@ class RegionField:
             part = functor.construct(self.region, complete=complete)
             assert part is not None
             partition = part
+            if self._partitions.get_size() == len(self._partitions):
+                assert self._partitions.get_size() > 0
+                last_used = self._partitions.peek_last_item()[0]
+                # Already delete the index partition associated here.
+                key = (self.region.index_space, last_used, None)
+                if key in runtime.partition_manager._index_partitions:
+                    del runtime.partition_manager._index_partitions[key]
+                    # print("Successfully deleted!")
+                # else:
+                    # print("Did not delete...", functor, last_used)
+                # assert (self.region.index_space, functor, None) in runtime.partition_manager._index_partitions
+
             self._partitions[functor] = partition
 
         child_region = partition.get_child(Point(color))
@@ -781,6 +796,14 @@ class Storage:
                 self._unique_id, functor, part
             )
         return part
+
+    def __del__(self):
+        if self._unique_id in runtime.partition_manager._legion_partitions_by_storage_id:
+            for key in runtime.partition_manager._legion_partitions_by_storage_id[self._unique_id]:
+                if key in runtime.partition_manager._legion_partitions:
+                    del runtime.partition_manager._legion_partitions[key]
+            del runtime.partition_manager._legion_partitions_by_storage_id[self._unique_id]
+        self.reset_key_partition()
 
 
 class StorePartition:
@@ -1393,3 +1416,39 @@ class Store:
         launch_shape = (self.shape + tile_shape - 1) // tile_shape
         partition = Tiling(tile_shape, launch_shape)
         return self.partition(partition)
+
+    def __del__(self):
+        if self._unique_id in runtime.partition_manager._partition_bases_by_held_store_id:
+            partitions = runtime.partition_manager._partition_bases_by_held_store_id[self._unique_id]
+            for part in partitions:
+                # Remove the dependent partitions from all referencing structures.
+                if part in runtime.partition_manager._index_partitions_by_partition_base:
+                    index_part_keys = runtime.partition_manager._index_partitions_by_partition_base[part]
+                    for key in index_part_keys:
+                        if key in runtime.partition_manager._index_partitions:
+                            del runtime.partition_manager._index_partitions[key]
+                            # print("Deleting key from _index_partitions")
+                    del runtime.partition_manager._index_partitions_by_partition_base[part]
+                if part in runtime.partition_manager._legion_partitions_by_partition_base:
+                    legion_part_keys = runtime.partition_manager._legion_partitions_by_partition_base[part]
+                    for key in legion_part_keys:
+                        if key in runtime.partition_manager._legion_partitions:
+                            del runtime.partition_manager._legion_partitions[key]
+                            # print("Deleting key from _legion_partitions")
+                    del runtime.partition_manager._legion_partitions_by_partition_base[part]
+            del runtime.partition_manager._partition_bases_by_held_store_id[self._unique_id]
+            # print("Resulting lens: ", len(runtime.partition_manager._index_partitions), len(runtime.partition_manager._legion_partitions))
+            # weija = len(runtime.partition_manager._index_partitions)
+            # if weija == 100:
+            #     print([(x[0], x[0].get_bounds(), x[1]) for x in runtime.partition_manager._index_partitions.keys()])
+            #     import sys
+            #     sys.exit(0)
+            # if (len(runtime.partition_manager._index_partitions) > 100 or len(runtime.partition_manager._legion_partitions) > 100):
+            #     print("Resulting lens: ", len(runtime.partition_manager._index_partitions), len(runtime.partition_manager._legion_partitions))
+                # print("BADDDDDDDD")
+            # print(len(runtime.index_spaces))
+            # keys = runtime.partition_manager._index_partitions.keys()
+            # from .partition import Weighted
+            # print(len([x for x in keys if isinstance(x[1], Weighted)]))
+        # Delete this store from the partition manager.
+        self.reset_key_partition()

@@ -17,6 +17,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod, abstractproperty
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Type, Union
+import weakref
 
 from . import (
     BufferBuilder,
@@ -94,6 +95,12 @@ class PartitionBase(ABC):
     @abstractproperty
     def requirement(self) -> RequirementType:
         ...
+
+    def get_stores(self) -> list[Any]:
+        return []
+
+    def valid(self) -> bool:
+        return True
 
 
 class Replicate(PartitionBase):
@@ -367,9 +374,10 @@ class Tiling(PartitionBase):
                 kind=kind,
                 keep=True,  # export this partition functor to other libraries
             )
-            runtime.partition_manager.record_index_partition(
-                index_space, self, index_partition, color_shape=color_shape
-            )
+            if self._offset == Shape((0,) * len(self._tile_shape)):
+                runtime.partition_manager.record_index_partition(
+                    index_space, self, index_partition, color_shape=color_shape
+                )
         return region.get_child(index_partition)
 
 
@@ -490,12 +498,42 @@ class ImagePartition(PartitionBase):
         complete: bool = True,
     ) -> None:
         self._mapper = mapper
-        self._store = store
+        self._store_ref = weakref.ref(store)
+        self._storage_id = self._store._storage._unique_id
+        self._store_version = self._store._version
         self._part = part
         # Whether this is an image or image_range operation.
         self._range = range
         self._disjoint = disjoint
         self._complete = complete
+
+    @property
+    def _store(self):
+        return self._store_ref()
+
+    def get_stores(self) -> list[Any]:
+        return [self._store]
+
+    def valid(self) -> bool:
+        return self._store is not None
+
+    # def make_weakref_gc_callback(self):
+    #     def callback(store):
+    #         part = self
+    #         # Remove the dependent partitions from all referencing structures.
+    #         if part in runtime.partition_manager._index_partitions_by_partition_base:
+    #             index_part_keys = runtime.partition_manager._index_partitions_by_partition_base[part]
+    #             for key in index_part_keys:
+    #                 if key in runtime.partition_manager._index_partitions:
+    #                     del runtime.partition_manager._index_partitions[key]
+    #             del runtime.partition_manager._index_partitions_by_partition_base[part]
+    #         if part in runtime.partition_manager._legion_partitions_by_partition_base:
+    #             legion_part_keys = runtime.partition_manager._legion_partitions_by_partition_base[part]
+    #             for key in legion_part_keys:
+    #                 if key in runtime.partition_manager._legion_partitions:
+    #                     del runtime.partition_manager._legion_partitions[key]
+    #             del runtime.partition_manager._legion_partitions_by_partition_base[part]
+    #     return callback
 
     @property
     def color_shape(self) -> Optional[Shape]:
@@ -592,7 +630,7 @@ class ImagePartition(PartitionBase):
         return hash(
             (
                 self.__class__,
-                self._store._storage,
+                self._storage_id,
                 # Importantly, we _cannot_ store the version of the store
                 # in the hash value. This is because the store's version may
                 # change after we've already put this functor into a table.
@@ -615,8 +653,8 @@ class ImagePartition(PartitionBase):
             # not be equal due to transformations on the store. By checking
             # that the Storages are equal, we are basically checking whether
             # we have the same RegionField object.
-            and self._store._storage == other._store._storage
-            and self._store.version == other._store.version
+            and self._storage_id == other._storage_id
+            and self._store_version == other._store_version
             and self._part == other._part
             and self._range == other._range
             and self._mapper == other._mapper
@@ -644,7 +682,8 @@ class PreimagePartition(PartitionBase):
         complete: bool = True,
     ) -> None:
         self._mapper = mapper
-        self._source = source
+        self._source_ref = weakref.ref(source)
+        self._source_storage_id = self._source._storage._unique_id
         # Importantly, we don't store a reference to `dest` and instead
         # hold onto a handle of the underlying region. This is important
         # because if we store dest itself on the partition then legate
@@ -657,6 +696,13 @@ class PreimagePartition(PartitionBase):
         self._range = range
         self._disjoint = disjoint
         self._complete = complete
+
+    @property
+    def _source(self):
+        return self._source_ref()
+
+    def get_stores(self) -> list[Any]:
+        return [self._source]
 
     @property
     def color_shape(self) -> Optional[Shape]:
@@ -741,7 +787,7 @@ class PreimagePartition(PartitionBase):
         return hash(
             (
                 self.__class__,
-                self._source._storage,
+                self._source_storage_id,
                 # Importantly, we _cannot_ store the version of the store
                 # in the hash value. This is because the store's version may
                 # change after we've already put this functor into a table.
@@ -762,7 +808,7 @@ class PreimagePartition(PartitionBase):
             isinstance(other, PreimagePartition)
             # See the comment on ImagePartition.__eq__ about why we use
             # source._storage for equality.
-            and self._source._storage == other._source._storage
+            and self._source_storage_id == other._source_storage_id
             and self._source._version == other._source._version
             and self._dest_region.index_space == other._dest_region.index_space
             and self._part == other._part
@@ -819,9 +865,9 @@ class DomainPartition(PartitionBase):
                 functor=functor,
                 keep=True,
             )
-            runtime.partition_manager.record_index_partition(
-                index_space, self, index_partition
-            )
+            # runtime.partition_manager.record_index_partition(
+            #     index_space, self, index_partition
+            # )
         return region.get_child(index_partition)
 
     # TODO (rohany): We could figure this out by staring at the domain map.

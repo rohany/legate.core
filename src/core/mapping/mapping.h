@@ -95,7 +95,7 @@ struct InstanceMappingPolicy {
   AllocPolicy allocation{AllocPolicy::MAY_ALLOC};
   InstLayout layout{InstLayout::SOA};
   DimOrdering ordering{};
-  bool exact{false};
+  bool exact{true};
 
  public:
   InstanceMappingPolicy() {}

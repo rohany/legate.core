@@ -72,12 +72,38 @@ class IndexSpace:
                 "IndexSpace can only own its handle if the parent "
                 "IndexPartition also owns its handle"
             )
+        # import io
+        # writer = io.StringIO()
+        # import traceback
+        # traceback.print_stack(file=writer)
+        # writer.seek(0)
+        # bt = writer.read()
+        # tag = None
+        # if "runtime.find_or_create_index_space" in bt:
+        #     tag = "find_or_create"
+        # elif "runtime.import_output_region" in bt:
+        #     tag = "output_region"
+        # elif "index_partition.get_child" in bt:
+        #     tag = "get_child"
+        # else:
+        #     print(bt)
+        # print(f"Constructing index space. {handle} {tag}")
+        # if tag == "get_child":
+        #     print(bt)
+        # self.tag = tag
+        # bounds = self.get_bounds()
+        # if (bounds.lo[0] == 0 and bounds.hi[0] == 9999) or (bounds.lo[0] == 0 and bounds.hi[0] == 0):
+        #     import traceback
+        #     traceback.print_stack()
+        # print("Creating index space with bounds: ", self.get_bounds())
 
     def __del__(self) -> None:
         # We only need to delete top-level index spaces
         # Ignore any deletions though that occur after the task is done
         if self.owned and self.parent is None:
             self.destroy(unordered=True)
+        # elif self.parent is not None:
+        #     print(f"Failing deletion of non-parent ispace: {self.handle} {self.tag}")
 
     def _can_delete(self) -> bool:
         if not self.owned:
@@ -88,6 +114,7 @@ class IndexSpace:
         return self.owned
 
     def add_child(self, child: IndexPartition) -> None:
+        return
         """
         Add a child partition to this IndexSpace.
         """
@@ -115,13 +142,16 @@ class IndexSpace:
         if self.parent is not None:
             raise RuntimeError("Only root IndexSpace objects can be destroyed")
         if not self.owned:
+            print(f"Failed destroy call for index space")
             return
         self.owned = False
         # Check to see if we're still inside the context of the task
         # If not then we just need to leak this index space
         if self.context not in _pending_unordered:
+            print("Failed destroy for index space context not in _pending_unordered")
             return
         if unordered:
+            # print(f"Successful deletion enqueue {self.handle} {self.tag}")
             # See if we have a _logical_handle from an OutputRegion
             # that we need to pass along to keep things alive
             if hasattr(self, "_logical_handle"):
@@ -136,6 +166,7 @@ class IndexSpace:
                     ((self.handle, None), type(self))
                 )
         else:
+            # print(f"Successful explicit deletion {self.handle} {self.tag}")
             legion.legion_index_space_destroy_unordered(
                 self.runtime, self.context, self.handle, False
             )

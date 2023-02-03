@@ -68,6 +68,9 @@ class Shape:
             self._extents = tuple(hi[idx] + 1 for idx in range(hi.dim))
         return self._extents
 
+    def drop_ispace(self):
+        self._ispace = None
+
     def __str__(self) -> str:
         if self._extents is not None:
             return f"Shape({self._extents})"

@@ -140,13 +140,17 @@ def find_cycles(for_futures: bool) -> bool:
             return isinstance(obj, (Future, FutureMap))
 
     else:
-        from .store import RegionField
+        from .store import RegionField, Store
+        from ._legion import FutureMap, FieldSpace, IndexSpace, IndexPartition, Region, OutputRegion
+        from .runtime import RegionManager
+        from ._legion import Future, FutureMap
 
         def is_interesting(obj: Any) -> bool:
-            return isinstance(obj, RegionField)
+            return isinstance(obj, IndexPartition)
 
     found_cycles = False
     all_objs = gc.get_objects()
+    print("num interesting objs", len([x for x in all_objs if is_interesting(x)]))
     all_ids = set(id(obj) for obj in all_objs)
     for obj in all_objs:
         if is_interesting(obj):

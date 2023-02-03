@@ -616,7 +616,7 @@ bool BaseMapper::map_legate_store(const MapperContext ctx,
         // store reduction instance
         if (fields.size() == 1 && regions.size() == 1) {
           auto fid = fields.front();
-          reduction_instances->record_instance(redop, regions.front(), fid, result, policy);
+          // reduction_instances->record_instance(redop, regions.front(), fid, result, policy);
         }
       }
       runtime->enable_reentrant(ctx);
@@ -711,7 +711,7 @@ bool BaseMapper::map_legate_store(const MapperContext ctx,
     if (!result.is_external_instance() && group != nullptr) {
       assert(fields.size() == 1);
       auto fid = fields.front();
-      local_instances->record_instance(group, fid, result, policy);
+      // local_instances->record_instance(group, fid, result, policy);
     }
     runtime->enable_reentrant(ctx);
     // We made it so no need for an acquire

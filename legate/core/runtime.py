@@ -19,7 +19,7 @@ import math
 import struct
 import sys
 import weakref
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass
 from types import ModuleType
 from typing import (
@@ -237,12 +237,12 @@ class FieldMatch(Dispatchable[Future]):
 # A simple manager that keeps track of free fields from all free managers
 # and outstanding field matches issued for them.
 class FieldMatchManager:
-    def __init__(self, runtime: Runtime) -> None:
-        self._runtime = runtime
+    def __init__(self, runtime) -> None:
         self._freed_fields: List[FreeFieldInfo] = []
         self._matches: Deque[FieldMatch] = deque()
         self._match_counter = 0
         self._match_frequency = runtime.max_field_reuse_frequency
+        self._runtime = runtime
 
     def add_free_field(
         self, manager: FieldManager, region: Region, field_id: int
@@ -312,6 +312,18 @@ class RegionManager:
         # ordered destructions, whereas in a destructor we can only do
         # unordered destructions
         self._region.destroy(unordered)
+        if self._imported:
+            if self._region.index_space in runtime.partition_manager._index_partitions_by_index_space:
+                for key in runtime.partition_manager._index_partitions_by_index_space[self._region.index_space]:
+                    from .partition import Weighted
+                    if key in runtime.partition_manager._index_partitions:
+                        del runtime.partition_manager._index_partitions[key]
+                    else:
+                        if isinstance(key[1], Weighted):
+                            print("Failed to delete weighted part: ", key)
+                del runtime.partition_manager._index_partitions_by_index_space[self._region.index_space]
+            self._region.index_space.destroy(unordered)
+            self._region.field_space.destroy(unordered)
 
     def increase_active_field_count(self) -> bool:
         revived = self._active_field_count == 0
@@ -348,11 +360,12 @@ class RegionManager:
 # This class manages the allocation and reuse of fields
 class FieldManager:
     def __init__(
-        self, runtime: Runtime, shape: Shape, field_size: int
+        self, shape: Shape, field_size: int
     ) -> None:
         assert isinstance(field_size, int)
-        self.runtime = runtime
         self.shape = shape
+        _ = self.shape.extents
+        self.shape.drop_ispace()
         self.field_size = field_size
         # This is a sanitized list of (region,field_id) pairs that is
         # guaranteed to be ordered across all the shards even with
@@ -369,16 +382,16 @@ class FieldManager:
 
     def allocate_field(self) -> tuple[Region, int]:
         if (result := self.try_reuse_field()) is not None:
-            region_manager = self.runtime.find_region_manager(result[0])
+            region_manager = runtime.find_region_manager(result[0])
             if region_manager.increase_active_field_count():
-                self.runtime.revive_manager(region_manager)
+                runtime.revive_manager(region_manager)
             return result
-        region_manager = self.runtime.find_or_create_region_manager(self.shape)
+        region_manager = runtime.find_or_create_region_manager(self.shape)
         region, field_id, revived = region_manager.allocate_field(
             self.field_size
         )
         if revived:
-            self.runtime.revive_manager(region_manager)
+            runtime.revive_manager(region_manager)
         return region, field_id
 
     def free_field(
@@ -389,19 +402,19 @@ class FieldManager:
         # that space without having to make an instance allocation of the
         # same size and shape.
         buf = ffi.new("char[]", self.field_size)
-        fut = Future.from_buffer(self.runtime.legion_runtime, ffi.buffer(buf))
+        fut = Future.from_buffer(runtime.legion_runtime, ffi.buffer(buf))
         fill = Fill(
             region,
             region,
             field_id,
             fut,
-            mapper=self.runtime.core_context.mapper_id,
+            mapper=runtime.core_context.mapper_id,
         )
-        fill.launch(self.runtime.legion_runtime, self.runtime.legion_context)
+        fill.launch(runtime.legion_runtime, runtime.legion_context)
         self.free_fields.append((region, field_id))
-        region_manager = self.runtime.find_region_manager(region)
+        region_manager = runtime.find_region_manager(region)
         if region_manager.decrease_active_field_count():
-            self.runtime.free_region_manager(
+            runtime.free_region_manager(
                 self.shape, region, unordered=not ordered
             )
 
@@ -411,9 +424,9 @@ class FieldManager:
 
 class ConsensusMatchingFieldManager(FieldManager):
     def __init__(
-        self, runtime: Runtime, shape: Shape, field_size: int
+        self, shape: Shape, field_size: int
     ) -> None:
-        super().__init__(runtime, shape, field_size)
+        super().__init__(shape, field_size)
         self._field_match_manager = runtime.field_match_manager
         self._update_match_credit()
 
@@ -421,17 +434,17 @@ class ConsensusMatchingFieldManager(FieldManager):
         if self.shape.fixed:
             size = self.shape.volume() * self.field_size
             self._match_credit = (
-                size + self.runtime.max_field_reuse_size - 1
-                if size > self.runtime.max_field_reuse_size
-                else self.runtime.max_field_reuse_size
-            ) // self.runtime.max_field_reuse_size
+                size + runtime.max_field_reuse_size - 1
+                if size > runtime.max_field_reuse_size
+                else runtime.max_field_reuse_size
+            ) // runtime.max_field_reuse_size
             # No need to update the credit as the exact size is known
             self._need_to_update_match_credit = False
         # If the shape is unknown, we set the credit such that every new
         # free field leads to a consensus match, and ask the manager
         # to update the credit.
         else:
-            self._match_credit = self.runtime.max_field_reuse_frequency
+            self._match_credit = runtime.max_field_reuse_frequency
             self._need_to_update_match_credit = True
 
     def try_reuse_field(self) -> Optional[tuple[Region, int]]:
@@ -651,15 +664,45 @@ class PartitionManager:
         ] = {}
         self._piece_factors: dict[int, list[int]] = {}
 
-        self._index_partitions: dict[
-            tuple[IndexSpace, PartitionBase, Optional[Shape]], IndexPartition
-        ] = {}
+        # self._index_partitions: dict[
+        #     tuple[IndexSpace, PartitionBase, Optional[Shape]], IndexPartition
+        # ] = {}
+
+        from lru import LRU
+        self._index_partitions = LRU(100)
         # Maps storage id-partition pairs to Legion partitions
-        self._legion_partitions: dict[
-            tuple[int, PartitionBase], Union[None, LegionPartition]
-        ] = {}
+        # self._legion_partitions: dict[
+        #     tuple[int, PartitionBase], Union[None, LegionPartition]
+        # ] = {}
+
+        self._legion_partitions = LRU(100)
         self._storage_key_partitions: dict[tuple[int, int], PartitionBase] = {}
         self._store_key_partitions: dict[tuple[int, int], PartitionBase] = {}
+
+        # Backwards maps for deleting these data structures when
+        # certain types of partitions become invalid.
+        self._index_partitions_by_partition_base: dict[
+            PartitionBase, set[tuple[IndexSpace, PartitionBase, Optional[Shape]]]
+        ] = defaultdict(lambda: set())
+        import weakref
+        # self._index_partitions_by_index_space: dict[
+        #     IndexSpace, set[tuple[IndexSpace, PartitionBase, Optional[Shape]]]
+        # ] = defaultdict(lambda: set())
+        self._index_partitions_by_index_space = weakref.WeakKeyDictionary()
+        
+        self._legion_partitions_by_partition_base = weakref.WeakKeyDictionary()
+        # self._legion_partitions_by_partition_base: dict[
+        #     PartitionBase, set[tuple[int, PartitionBase]]
+        # ] = defaultdict(lambda: set())
+
+
+        self._legion_partitions_by_storage_id: dict[
+            int, set[tuple[int, PartitionBase]]
+        ] = defaultdict(lambda: set())
+        self._partition_bases_by_held_store_id: dict[
+            int, set[PartitionBase]
+        ] = defaultdict(lambda: set())
+
 
     def get_current_num_pieces(self) -> int:
         return self._runtime.machine.num_procs
@@ -908,15 +951,34 @@ class PartitionManager:
         index_partition: IndexPartition,
         color_shape: Optional[Shape] = None,
     ) -> None:
+        from .partition import Weighted, DomainPartition, PartitionBase
+        assert isinstance(functor, PartitionBase)
         key = (index_space, functor, color_shape)
         assert key not in self._index_partitions
         self._index_partitions[key] = index_partition
+        stores = functor.get_stores()
+        if len(stores) > 0:
+            self._index_partitions_by_partition_base[functor].add(key)
+            for store in stores:
+                self._partition_bases_by_held_store_id[store._unique_id].add(functor)
+
+        if isinstance(functor, Weighted):
+            if index_space not in self._index_partitions_by_index_space:
+                self._index_partitions_by_index_space[index_space] = set()
+            self._index_partitions_by_index_space[index_space].add(key)
+
+        assert not isinstance(functor, DomainPartition)
+
+        # self._index_partitions_by_partition_base[functor].add((index_space, functor, color_shape))
 
     def find_store_key_partition(
         self, store_id: int, restrictions: tuple[Restriction, ...]
     ) -> Union[None, PartitionBase]:
         key = (self.get_current_num_pieces(), store_id)
         partition = self._store_key_partitions.get(key)
+        if partition is not None and not partition.valid():
+            del self._store_key_partitions[key]
+            partition = None
         if partition is not None and not partition.satisfies_restriction(
             restrictions
         ):
@@ -928,6 +990,12 @@ class PartitionManager:
     ) -> None:
         key = (self.get_current_num_pieces(), store_id)
         self._store_key_partitions[key] = key_partition
+        # TODO (rohany): IDK if this is needed.
+        stores = key_partition.get_stores()
+        if len(stores) > 0:
+            for store in stores:
+                self._partition_bases_by_held_store_id[store._unique_id].add(key_partition)
+        self._partition_bases_by_held_store_id[store_id].add(key_partition)
 
     def reset_store_key_partition(self, store_id: int) -> None:
         key = (self.get_current_num_pieces(), store_id)
@@ -939,6 +1007,9 @@ class PartitionManager:
     ) -> Union[None, PartitionBase]:
         key = (self.get_current_num_pieces(), storage_id)
         partition = self._storage_key_partitions.get(key)
+        if partition is not None and not partition.valid():
+            del self._storage_key_partitions[key]
+            partition = None
         if partition is not None and not partition.satisfies_restriction(
             restrictions
         ):
@@ -970,8 +1041,20 @@ class PartitionManager:
         functor: PartitionBase,
         legion_partition: Optional[LegionPartition],
     ) -> None:
+        from .partition import Weighted, DomainPartition
+        if isinstance(functor, DomainPartition):
+            return
+
         key = (storage_id, functor)
         self._legion_partitions[key] = legion_partition
+        # if functor not in self._legion_partitions_by_partition_base:
+        #     self._legion_partitions_by_partition_base[functor] = set()
+
+        # if len(functor.get_stores()) > 0:
+        #     self._legion_partitions_by_partition_base[functor].add(key)
+
+        self._legion_partitions_by_storage_id[storage_id].add(key)
+        # self._legion_partitions_by_partition_base[functor].add(key)
 
 
 class CommunicatorManager:
@@ -1324,6 +1407,7 @@ class Runtime:
             # We also need to bump the versions for each modified store.
             # TODO (rohany): We also need a callback here to evict cached
             #  partitions with old store values so that we don't leak these.
+            # TODO (rohany): Actually do this...
             for store in op.get_all_modified_stores():
                 store.bump_version()
 
@@ -1545,7 +1629,7 @@ class Runtime:
         field_mgr = self.field_managers.get(key)
         if field_mgr is not None:
             return field_mgr
-        field_mgr = self._field_manager_class(self, shape, field_size)
+        field_mgr = self._field_manager_class(shape, field_size)
         self.field_managers[key] = field_mgr
         return field_mgr
 
@@ -1791,6 +1875,7 @@ class _CycleCheckWrapper(ModuleType):
         return getattr(self._wrapped_mod, attr)
 
     def __del__(self) -> None:
+        gc.collect()
         print(
             "Looking for cycles that are stopping RegionFields from getting "
             "collected and reused."

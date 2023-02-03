@@ -18,13 +18,15 @@ from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import numpy as np
 
-from . import AffineTransform, Point, Rect, Transform as LegionTransform
+from . import AffineTransform, Point, Rect, Transform as LegionTransform, FutureMap
 from .partition import (
     AffineProjection,
     DomainPartition,
     Replicate,
     Restriction,
     Tiling,
+    ffi,
+    legion,
 )
 from .projection import ProjExpr
 from .runtime import runtime
@@ -125,6 +127,39 @@ class Shift(Transform):
                 partition.color_shape,
                 partition.offset.update(self._dim, offset),
             )
+        elif isinstance(partition, DomainPartition):
+            projected = {}
+            if isinstance(partition._domains, FutureMap):
+                for point in Rect(hi=partition.color_shape):
+                    fut = partition._domains.get_future(point)
+                    buf = fut.get_buffer()
+                    dom = ffi.from_buffer("legion_domain_t*", buf)[0]  # type: ignore # noqa
+                    lg_rect = getattr(
+                        legion, f"legion_domain_get_rect_{dom.dim}d"
+                    )(dom)
+                    lo = Point(dim=dom.dim)
+                    hi = Point(dim=dom.dim)
+                    for i in range(dom.dim):
+                        lo[i] = lg_rect.lo.x[i]
+                        hi[i] = lg_rect.hi.x[i]
+                    lo[self._dim] -= self._offset
+                    hi[self._dim] -= self._offset
+                    projected[point] = Rect(
+                        lo=tuple(lo), hi=tuple(hi), exclusive=False
+                    )
+            else:
+                for p, r in partition._domains.items():
+                    lo = Point(dim=r.dim)
+                    hi = Point(dim=r.dim)
+                    for i in range(0, p.dim):
+                        lo[i] = r.lo[i]
+                        hi[i] = r.hi[i]
+                    lo[self._dim] -= self._offset
+                    hi[self._dim] -= self._offset
+                    projected[p] = Rect(
+                        lo=tuple(lo), hi=tuple(hi), exclusive=False
+                    )
+            return DomainPartition(partition._shape, partition.color_shape, projected)
         else:
             raise ValueError(
                 f"Unsupported partition: {type(partition).__name__}"
@@ -362,6 +397,21 @@ class Project(Transform):
                 partition.color_shape.insert(self._dim, 1),
                 partition.offset.insert(self._dim, self._index),
             )
+        elif isinstance(partition, DomainPartition):
+            # Add back in a dummy dimension?
+            new_shape = partition._shape.insert(self._dim, 1)
+            all_axes = list(range(0, len(partition._shape)))
+            axes = all_axes[: self._dim] + [
+                x + 1 for x in all_axes[self._dim:]
+            ]
+
+            def tx_point(p: Point, exclusive: bool = False) -> Point:
+                return Point(
+                    Shape(p).insert(self._dim, 1 if exclusive else 0)
+                )
+
+            return AffineProjection(axes).project_partition(partition, Rect(hi=new_shape), tx_point=tx_point)
+
         else:
             raise ValueError(
                 f"Unsupported partition: {type(partition).__name__}"
@@ -465,6 +515,13 @@ class Transpose(Transform):
                 partition.color_shape.map(self._inverse),
                 partition.offset.map(self._inverse),
             )
+        elif isinstance(partition, DomainPartition):
+            # Apply the transpose as an AffineProjection.
+            shape = partition._shape.map(self._inverse)
+            axes = Shape([i for i in range(shape.ndim)]).map(self._inverse)
+            def tx_point(p: Point, exclusive: bool = False) -> Point:
+                return Point(Shape(p).map(self._inverse))
+            return AffineProjection(list(axes)).project_partition(partition, Rect(hi=shape), tx_point=tx_point)
         else:
             raise ValueError(
                 f"Unsupported partition: {type(partition).__name__}"
