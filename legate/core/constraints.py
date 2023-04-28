@@ -86,6 +86,7 @@ class Lit(Expr):
 
 
 class PartSym(Expr):
+    # TODO (rohany): I don't think that I need to do anything here because
     def __init__(
         self,
         op_hash: int,
@@ -108,6 +109,8 @@ class PartSym(Expr):
     def ndim(self) -> int:
         return self._store.ndim
 
+    # TODO (rohany): This should be fine, as external clients shouldn't
+    #  use this to access a store.
     @property
     def store(self) -> Store:
         return self._store

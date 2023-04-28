@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from .operation import AutoTask, Copy, Fill, ManualTask
     from .runtime import Runtime
     from .shape import Shape
-    from .store import RegionField, Store
+    from .store import RegionField, Store, ExternalStoreReference
     from .types import Dtype
 
 T = TypeVar("T")
@@ -306,19 +306,37 @@ class Context:
         """
         from .operation import Fill
 
-        return Fill(
-            self,
-            lhs,
-            value,
-            self.get_unique_op_id(),
-            self._runtime.machine,
-        )
+        # TODO (rohany): Circular import for the wrapper...
+        from .store import ExternalStoreReference
+        if isinstance(lhs, ExternalStoreReference):
+            lhs = lhs._base
+        if isinstance(value, ExternalStoreReference):
+            rhs = value._base
+
+        return Fill(self, lhs, value, self.get_unique_op_id(), self._runtime.machine)
 
     def dispatch(self, op: Dispatchable[T]) -> T:
         return self._runtime.dispatch(op)
 
     def dispatch_single(self, op: Dispatchable[T]) -> T:
         return self._runtime.dispatch_single(op)
+
+    def create_store_internal(
+        self,
+        dtype: Dtype,
+        shape: Optional[Union[Shape, tuple[int, ...]]] = None,
+        storage: Optional[Union[RegionField, Future]] = None,
+        optimize_scalar: bool = False,
+        ndim: Optional[int] = None,
+    ) -> Store:
+        dtype = self.type_system[ty]
+        return self._runtime.create_store(
+            dtype,
+            shape=shape,
+            data=storage,
+            optimize_scalar=optimize_scalar,
+            ndim=ndim,
+        )
 
     def create_store(
         self,
@@ -327,7 +345,7 @@ class Context:
         storage: Optional[Union[RegionField, Future]] = None,
         optimize_scalar: bool = False,
         ndim: Optional[int] = None,
-    ) -> Store:
+    ) -> ExternalStoreReference:
         """
         Creates a fresh store.
 
@@ -356,13 +374,8 @@ class Context:
         Store
             A new store
         """
-        return self._runtime.create_store(
-            dtype,
-            shape=shape,
-            data=storage,
-            optimize_scalar=optimize_scalar,
-            ndim=ndim,
-        )
+        from .store import ExternalStoreReference
+        return ExternalStoreReference(self.create_store_internal(dtype, shape=shape, storage=storage, optimize_scalar=optimize_scalar, ndim=ndim))
 
     def get_nccl_communicator(self) -> Communicator:
         return self._runtime.get_nccl_communicator()
@@ -388,31 +401,7 @@ class Context:
         """
         self._runtime.issue_execution_fence(block=block)
 
-    def tree_reduce(self, task_id: int, store: Store, radix: int = 4) -> Store:
-        """
-        Performs a user-defined reduction by building a tree of reduction
-        tasks. At each step, the reducer task gets up to ``radix`` input stores
-        and is supposed to produce outputs in a single unbound store.
-
-        Parameters
-        ----------
-        task_id : int
-            Id of the reducer task
-
-        store : Store
-            Store to perform reductions on
-
-        radix : int
-            Fan-in of each reducer task. If the store is partitioned into
-            :math:`N` sub-stores by the runtime, then the first level of
-            reduction tree has :math:`\\ceil{N / \\mathtt{radix}}` reducer
-            tasks.
-
-        Returns
-        -------
-        Store
-            Store that contains reduction results
-        """
+    def tree_reduce_internal(self, task_id: int, store: Store, radix: int = 4) -> Store:
         from .operation import Reduce
 
         if store.ndim > 1:
@@ -440,3 +429,34 @@ class Context:
         task.add_output(result)
         task.execute()
         return result
+
+    def tree_reduce(self, task_id: int, store: Store, radix: int = 4) -> ExternalStoreReference:
+        """
+        Performs a user-defined reduction by building a tree of reduction
+        tasks. At each step, the reducer task gets up to ``radix`` input stores
+        and is supposed to produce outputs in a single unbound store.
+
+        Parameters
+        ----------
+        task_id : int
+            Id of the reducer task
+
+        store : Store
+            Store to perform reductions on
+
+        radix : int
+            Fan-in of each reducer task. If the store is partitioned into
+            :math:`N` sub-stores by the runtime, then the first level of
+            reduction tree has :math:`\\ceil{N / \\mathtt{radix}}` reducer
+            tasks.
+
+        Returns
+        -------
+        Store
+            Store that contains reduction results
+        """
+        # TODO (rohany): Circular reference with the wrapper.
+        from .store import ExternalStoreReference
+        if isinstance(store, ExternalStoreReference):
+            store = store._base
+        return ExternalStoreReference(self.tree_reduce_internal(task_id, store, radix))

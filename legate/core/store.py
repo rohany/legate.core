@@ -772,7 +772,11 @@ class Storage:
         return part
 
 
+# TODO (rohany): In order to ensure that these references work out correctly,
+#  we might need a wrapper type around StorePartitions that wraps each of the
+#  types with the correct wrapper for the return values here.
 class StorePartition:
+    # TODO (rohany): I don't think that an unwrap here is necessary?
     def __init__(
         self,
         store: Store,
@@ -783,6 +787,7 @@ class StorePartition:
         self._partition = partition
         self._storage_partition = storage_partition
 
+    # TODO (rohany): I think that this one is OK to ignore for now?
     @property
     def store(self) -> Store:
         """
@@ -811,6 +816,7 @@ class StorePartition:
     def transform(self) -> TransformStackBase:
         return self._store.transform
 
+    # TODO (rohany): I think that this one is OK to ignore for now?
     def get_child_store(self, *indices: int) -> Store:
         """
         Returns the sub-store of a given color
@@ -902,6 +908,7 @@ class Store:
         # when no custom functor is given
         self._projection: Union[None, int] = None
         self._restrictions: Union[None, tuple[Restriction, ...]] = None
+        self._num_external_references = 0
 
         if self._shape is not None:
             if any(extent < 0 for extent in self._shape.extents):
@@ -1733,3 +1740,55 @@ class Store:
         launch_shape = (self.shape + tile_shape - 1) // tile_shape
         partition = Tiling(tile_shape, launch_shape)
         return self.partition(partition)
+
+    def increase_external_reference_count(self):
+        self._num_external_references += 1
+
+    def decrease_external_reference_count(self):
+        self._num_external_references -= 1
+
+    def has_external_references(self) -> bool:
+        return self._num_external_references == 0
+
+
+# ExternalStoreReference is a wrapper around a Store that
+# is intended to be the "external" view of a store that
+# libraries building on top of legate core have. It benefits
+# legate to understand when libraries have dropped all
+# references to a store, as this enables further optimizations
+# on a task stream, such as temporary store elimination. However,
+# the core itself should operate entirely upon normal Store objects,
+# to separately understand references held internal to the runtime,
+# versus references held by external libraries.
+class ExternalStoreReference:
+    def __init__(self, base : Store):
+        self._base = base
+        self._base.increase_external_reference_count()
+
+    def __del__(self):
+        self._base.decrease_external_reference_count()
+
+    @staticmethod
+    def _store_result_wrapper(func):
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+            # If the result is a Store, wrap the store in an
+            # external reference, because this operation is being
+            # done in an external library.
+            if isinstance(result, Store):
+                result = ExternalStoreReference(result)
+            return result
+        return wrapper
+
+    def __getattr__(self, item):
+        result = getattr(self._base, item)
+        if callable(result):
+            result = ExternalStoreReference._store_result_wrapper(result)
+        return result
+
+def external_store_reference_unwrapper_boilerplate(func):
+    def wrapper(*args, **kwargs):
+        newargs = [arg._base if isinstance(arg, ExternalStoreReference) else arg for arg in args]
+        newkwargs = {key : (arg._base if isinstance(arg, ExternalStoreReference) else arg) for key, arg in kwargs.items()}
+        return func(*newargs, **newkwargs)
+    return wrapper

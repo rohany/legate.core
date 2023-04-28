@@ -37,7 +37,7 @@ from .launcher import (
 from .partition import REPLICATE, Weighted
 from .runtime import runtime
 from .shape import Shape
-from .store import Store, StorePartition
+from .store import Store, StorePartition, external_store_reference_unwrapper_boilerplate
 from .utils import OrderedSet, capture_traceback_repr
 
 if TYPE_CHECKING:
@@ -162,6 +162,7 @@ class Operation(OperationProtocol):
         result.update(store for (store, _) in self._reductions)
         return result
 
+    @external_store_reference_unwrapper_boilerplate
     def add_alignment(self, store1: Store, store2: Store) -> None:
         """
         Sets an alignment between stores. Equivalent to the following code:
@@ -197,6 +198,7 @@ class Operation(OperationProtocol):
         part2 = self._get_unique_partition(store2)
         self.add_constraint(part1 == part2)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_broadcast(
         self, store: Store, axes: Optional[Union[int, Iterable[int]]] = None
     ) -> None:
@@ -241,12 +243,14 @@ class Operation(OperationProtocol):
         self._context.runtime.submit(self)
 
     @staticmethod
+    @external_store_reference_unwrapper_boilerplate
     def _check_store(store: Store, allow_unbound: bool = False) -> None:
         if not isinstance(store, Store):
             raise ValueError(f"Expected a Store, but got {type(store)}")
         elif not allow_unbound and store.unbound:
             raise ValueError("Expected a bound Store")
 
+    # TODO (rohany): I think that this one is OK.
     def _get_unique_partition(self, store: Store) -> PartSym:
         if store not in self._partitions:
             return self.declare_partition(store)
@@ -272,6 +276,7 @@ class Operation(OperationProtocol):
         libname = self.context.library.get_name()
         return f"{libname}.Operation(uid:{self._op_id})"
 
+    @external_store_reference_unwrapper_boilerplate
     def declare_partition(
         self, store: Store, disjoint: bool = True, complete: bool = True
     ) -> PartSym:
@@ -627,6 +632,7 @@ class AutoOperation(Operation):
         self._output_parts: list[PartSym] = []
         self._reduction_parts: list[PartSym] = []
 
+    @external_store_reference_unwrapper_boilerplate
     def get_requirement(
         self, store: Store, part_symb: PartSym, strategy: Strategy
     ) -> tuple[Proj, int, StorePartition]:
@@ -657,6 +663,7 @@ class AutoTask(AutoOperation, Task):
         self._reusable_stores: list[Tuple[Store, PartSym]] = []
         self._reuse_map: dict[int, Store] = {}
 
+    @external_store_reference_unwrapper_boilerplate
     def add_input(
         self, store: Store, partition: Optional[PartSym] = None
     ) -> None:
@@ -677,6 +684,7 @@ class AutoTask(AutoOperation, Task):
         self._inputs.append(store)
         self._input_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_output(
         self, store: Store, partition: Optional[PartSym] = None
     ) -> None:
@@ -701,6 +709,7 @@ class AutoTask(AutoOperation, Task):
         self._outputs.append(store)
         self._output_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_reduction(
         self, store: Store, redop: int, partition: Optional[PartSym] = None
     ) -> None:
@@ -725,6 +734,7 @@ class AutoTask(AutoOperation, Task):
         self._reductions.append((store, redop))
         self._reduction_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def record_reuse(
         self,
         strategy: Strategy,
@@ -887,6 +897,7 @@ class ManualTask(Operation, Task):
                 f"Expected a Store or StorePartition, but got {type(arg)}"
             )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_input(
         self,
         arg: Union[Store, StorePartition],
@@ -909,6 +920,7 @@ class ManualTask(Operation, Task):
             self._input_parts.append(arg)
         self._input_projs.append(proj)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_output(
         self,
         arg: Union[Store, StorePartition],
@@ -951,6 +963,7 @@ class ManualTask(Operation, Task):
             self._output_parts.append(arg)
         self._output_projs.append(proj)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_reduction(
         self,
         arg: Union[Store, StorePartition],
@@ -977,12 +990,14 @@ class ManualTask(Operation, Task):
             self._reduction_parts.append((arg, redop))
         self._reduction_projs.append(proj)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_alignment(self, store1: Store, store2: Store) -> None:
         raise TypeError(
             "Partitioning constraints are not allowed for "
             "manually parallelized tasks"
         )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_broadcast(
         self, store: Store, axes: Optional[Union[int, Iterable[int]]] = None
     ) -> None:
@@ -991,6 +1006,7 @@ class ManualTask(Operation, Task):
             "manually parallelized tasks"
         )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_constraint(self, constraint: Constraint) -> None:
         raise TypeError(
             "Partitioning constraints are not allowed for "
@@ -1080,6 +1096,7 @@ class Copy(AutoOperation):
     def inputs(self) -> list[Store]:
         return super().inputs + self._source_indirects + self._target_indirects
 
+    @external_store_reference_unwrapper_boilerplate
     def add_input(self, store: Store) -> None:
         """
         Adds a store as a source of the copy
@@ -1103,6 +1120,7 @@ class Copy(AutoOperation):
         self._inputs.append(store)
         self._input_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_output(self, store: Store) -> None:
         """
         Adds a store as a target of the copy. To avoid ambiguity in matching
@@ -1135,6 +1153,7 @@ class Copy(AutoOperation):
         self._outputs.append(store)
         self._output_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_reduction(self, store: Store, redop: int) -> None:
         """
         Adds a store as a reduction target of the copy. To avoid ambiguity in
@@ -1168,6 +1187,7 @@ class Copy(AutoOperation):
         self._reductions.append((store, redop))
         self._reduction_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_source_indirect(self, store: Store) -> None:
         """
         Adds an indirection for sources. A copy can have only up to one source
@@ -1193,6 +1213,7 @@ class Copy(AutoOperation):
         self._source_indirects.append(store)
         self._source_indirect_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_target_indirect(self, store: Store) -> None:
         """
         Adds an indirection for targets. A copy can have only up to one target
@@ -1266,11 +1287,13 @@ class Copy(AutoOperation):
                     constraints.append(src == tgt)
         return constraints
 
+    @external_store_reference_unwrapper_boilerplate
     def add_alignment(self, store1: Store, store2: Store) -> None:
         raise TypeError(
             "User partitioning constraints are not allowed for copies"
         )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_broadcast(
         self, store: Store, axes: Optional[Union[int, Iterable[int]]] = None
     ) -> None:
@@ -1278,6 +1301,7 @@ class Copy(AutoOperation):
             "User partitioning constraints are not allowed for copies"
         )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_constraint(self, constraint: Constraint) -> None:
         raise TypeError(
             "User partitioning constraints are not allowed for copies"
@@ -1378,11 +1402,13 @@ class Fill(AutoOperation):
         self._add_value(value)
         self._add_lhs(lhs)
 
+    @external_store_reference_unwrapper_boilerplate
     def _add_value(self, value: Store) -> None:
         partition = self._get_unique_partition(value)
         self._inputs.append(value)
         self._input_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def _add_lhs(self, lhs: Store) -> None:
         partition = self._get_unique_partition(lhs)
         self._outputs.append(lhs)
@@ -1392,11 +1418,13 @@ class Fill(AutoOperation):
         libname = self.context.library.get_name()
         return f"{libname}.Fill(uid:{self._op_id})"
 
+    @external_store_reference_unwrapper_boilerplate
     def add_alignment(self, store1: Store, store2: Store) -> None:
         raise TypeError(
             "User partitioning constraints are not allowed for fills"
         )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_broadcast(
         self, store: Store, axes: Optional[Union[int, Iterable[int]]] = None
     ) -> None:
@@ -1404,6 +1432,7 @@ class Fill(AutoOperation):
             "User partitioning constraints are not allowed for fills"
         )
 
+    @external_store_reference_unwrapper_boilerplate
     def add_constraint(self, constraint: Constraint) -> None:
         raise TypeError(
             "User partitioning constraints are not allowed for fills"
@@ -1456,12 +1485,14 @@ class Reduce(AutoOperation):
         self._radix = radix
         self._task_id = task_id
 
+    @external_store_reference_unwrapper_boilerplate
     def add_input(self, store: Store) -> None:
         self._check_store(store)
         partition = self._get_unique_partition(store)
         self._inputs.append(store)
         self._input_parts.append(partition)
 
+    @external_store_reference_unwrapper_boilerplate
     def add_output(self, store: Store) -> None:
         assert store.unbound
         partition = self._get_unique_partition(store)

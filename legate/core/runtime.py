@@ -687,6 +687,7 @@ class PartitionManager:
         self._piece_factors[num_pieces] = factors
         return factors
 
+    # TODO (rohany): Not sure if we need to unwrap here.
     def compute_launch_shape(
         self, store: Store, restrictions: tuple[Restriction, ...]
     ) -> Optional[Shape]:

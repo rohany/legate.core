@@ -100,7 +100,8 @@ from .runtime import (
     legate_add_library,
     track_provenance,
 )
-from .store import Store
+# TODO (rohany): This might be too bold...
+from .store import ExternalStoreReference as Store
 
 from .types import (
     array_type,

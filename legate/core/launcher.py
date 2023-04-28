@@ -54,6 +54,12 @@ if TYPE_CHECKING:
     from .store import RegionField, Store
     from .types import Dtype
 
+"""
+TODO (rohany): I took a pass over this file, and my take is that none of the methods
+ here need to have wrapping/unwrapping of input and output stores because this is
+ a layer of the core that external libraries should not be using.
+"""
+
 
 LegionOp = Union[IndexTask, SingleTask, IndexCopy, SingleCopy]
 
@@ -145,6 +151,7 @@ class ScalarArg:
 
 
 class FutureStoreArg:
+    # TODO (rohany): I think this doesn't need wrapping.
     def __init__(
         self, store: Store, read_only: bool, has_storage: bool, redop: int
     ) -> None:
@@ -169,6 +176,7 @@ class FutureStoreArg:
 
 
 class RegionFieldArg:
+    # TODO (rohany): I don't think this needs wrapping.
     def __init__(
         self,
         indexer: RequirementIndexer,
@@ -473,6 +481,7 @@ class OutputReq:
         self._create_output_region(fields)
         task.add_output(self.output_region)
 
+    # TODO (rohany): I don't know if this needs wrapping.
     def update_storage(self, store: Store, field_id: int) -> None:
         assert self.output_region is not None
         region_field = runtime.import_output_region(
@@ -648,6 +657,7 @@ class OutputAnalyzer(RequirementIndexer):
         self._requirements.clear()
         self._requirement_map.clear()
 
+    # TODO (rohany): I don't think this needs output wrapping.
     def insert(self, req: OutputReq, field_id: int, store: Store) -> None:
         group = self._groups.get(req)
         if group is None:

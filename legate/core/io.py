@@ -30,7 +30,7 @@ from .legate import Array, LegateDataInterface, Table
 from .partition import Tiling
 from .runtime import runtime
 from .shape import Shape
-from .store import DistributedAllocation, RegionField, Store
+from .store import DistributedAllocation, RegionField, Store, external_store_reference_unwrapper_boilerplate
 
 if TYPE_CHECKING:
     from . import Partition
@@ -49,6 +49,7 @@ class DataSplit:
     use one the concrete derived classes instead.
     """
 
+    @external_store_reference_unwrapper_boilerplate
     def make_partition(
         self,
         store: Store,
@@ -75,6 +76,7 @@ class CustomSplit(DataSplit):
         """
         self.get_subdomain = get_subdomain
 
+    @external_store_reference_unwrapper_boilerplate
     def make_partition(
         self,
         store: Store,
@@ -117,6 +119,7 @@ class TiledSplit(DataSplit):
         """
         self.tile_shape = tile_shape
 
+    @external_store_reference_unwrapper_boilerplate
     def make_partition(
         self,
         store: Store,
