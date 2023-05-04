@@ -66,6 +66,7 @@ class Context:
         self._logger = Logger(library.get_name())
 
         self._mapper_id = self._cpp_context.get_mapper_id()
+        self._dynamic_task_id_ctr = self._cpp_context.get_max_preregistered_task_id()
 
     def destroy(self) -> None:
         self._logger.destroy()
@@ -109,6 +110,11 @@ class Context:
 
     def get_task_id(self, task_id: int) -> int:
         return self._cpp_context.get_task_id(task_id)
+
+    def get_fresh_local_task_id(self) -> int:
+        result = self._dynamic_task_id_ctr
+        self._dynamic_task_id_ctr += 1
+        return result
 
     @property
     def mapper_id(self) -> int:
@@ -164,6 +170,11 @@ class Context:
         Narrows down the current machine by cutting out processors
         for which the task has no variant
         """
+        # TODO (rohany): For now, assume that tasks that are generated dynamically
+        # TODO (rohany): What's going on here?
+        if task_id >= self._cpp_context.get_max_preregistered_task_id():
+            assert False
+            return
         task_info = self._cpp_context.find_task(task_id)
         if not task_info.valid:
             raise ValueError(

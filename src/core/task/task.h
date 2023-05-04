@@ -69,6 +69,11 @@ struct LegateTask {
   static void register_variants(
     const std::map<LegateVariantCode, VariantOptions>& all_options = {});
 
+  // TODO (rohany): Comment...
+  static void register_variants(
+    std::unique_ptr<MLIRTaskBodyGenerator> generator,
+    const std::map<LegateVariantCode, VariantOptions>& all_options = {});
+
   /**
    * @brief Registers all variants of this task immediately.
    *

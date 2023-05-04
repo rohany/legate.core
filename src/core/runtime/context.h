@@ -57,6 +57,53 @@ class InvalidTaskIdException : public std::exception {
 
 /**
  * @ingroup runtime
+ * @brief POD for library configuration.
+ */
+struct ResourceConfig {
+  /**
+   * @brief Maximum number of tasks that the library can register
+   */
+  int64_t max_tasks{1024};
+  int64_t max_preregistered_task_id{1024};
+  /**
+   * @brief Maximum number of custom reduction operators that the library can register
+   */
+  int64_t max_reduction_ops{0};
+  int64_t max_projections{0};
+  int64_t max_shardings{0};
+};
+
+class ResourceIdScope {
+ public:
+  ResourceIdScope() = default;
+  ResourceIdScope(int64_t base, int64_t size) : base_(base), size_(size) {}
+
+ public:
+  ResourceIdScope(const ResourceIdScope&) = default;
+
+ public:
+  int64_t translate(int64_t local_resource_id) const { return base_ + local_resource_id; }
+  int64_t invert(int64_t resource_id) const
+  {
+    assert(in_scope(resource_id));
+    return resource_id - base_;
+  }
+
+ public:
+  bool valid() const { return base_ != -1; }
+  bool in_scope(int64_t resource_id) const
+  {
+    return base_ <= resource_id && resource_id < base_ + size_;
+  }
+  int64_t size() const { return size_; }
+
+ private:
+  int64_t base_{-1};
+  int64_t size_{-1};
+};
+
+/**
+ * @ingroup runtime
  * @brief A library context that provides APIs for registering components
  */
 class LibraryContext {
@@ -91,6 +138,7 @@ class LibraryContext {
 
  public:
   Legion::TaskID get_task_id(int64_t local_task_id) const;
+  Legion::TaskID get_max_preregistered_task_id() const;
   Legion::MapperID get_mapper_id() const { return mapper_id_; }
   Legion::ReductionOpID get_reduction_op_id(int64_t local_redop_id) const;
   Legion::ProjectionID get_projection_id(int64_t local_proj_id) const;
@@ -183,6 +231,7 @@ class LibraryContext {
   Legion::MapperID mapper_id_;
   std::unique_ptr<mapping::Mapper> mapper_;
   std::unordered_map<int64_t, std::unique_ptr<TaskInfo>> tasks_;
+  ResourceConfig resource_config_;
 };
 
 /**

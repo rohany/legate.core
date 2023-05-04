@@ -56,6 +56,7 @@ from . import (
 )
 from ._legion.env import LEGATE_MAX_FIELDS
 from ._legion.util import Dispatchable
+from ._lib.context import CppRuntime, PyMLIRTask  # type: ignore[import]
 from .allocation import Attachable
 from .communicator import CPUCommunicator, NCCLCommunicator
 from .corelib import core_library
@@ -1026,6 +1027,9 @@ class Runtime:
         self._core_context = self._context_list[0]
         self._core_library = core_library
 
+        # Initialize the JIT compilation infrastructure.
+        CppRuntime.initializeMLIRRuntime()
+
         self._unique_op_id = 0
         # This list maintains outstanding operations from all legate libraries
         # to be dispatched. This list allows cross library introspection for
@@ -1345,6 +1349,50 @@ class Runtime:
         # TODO: For now we run the partitioner for each operation separately.
         #       We will eventually want to compute a trace-wide partitioning
         #       strategy.
+
+        # TODO (rohany): For now, we're just trying to JIT individual tasks,
+        #  so create the new tasks and then partition them, as it seems like
+        #  I can't directly re-use the partition symbols from the existing
+        #  strategy.
+
+        if settings.kernel_fusion():
+            from .operation import AutoTask
+            newOps = []
+            for op in ops:
+                if isinstance(op, AutoTask):
+                    tid = op._task_id
+                    info = op.context._cpp_context.find_task(tid)
+                    assert(info.valid)
+                    has_mlir = info.has_mlir_variant()
+                    if has_mlir:
+                        gen = info.get_mlir_body_generator()
+                        module = gen.generate_body(
+                            [s.to_comp_time_store_desc() for s in op.inputs],
+                            [s.to_comp_time_store_desc() for s in op.outputs],
+                            [s[0].to_comp_time_store_desc() for s in op.reductions],
+                        )
+                        module.dump()
+                        module.lowerToLLVMDialect()
+                        funcptr = module.jitToLLVM()
+                        local_task_id = op.context.get_fresh_local_task_id()
+                        PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id))
+                        # Now construct a new AutoTask using this ID.
+                        newTask = op.context.create_auto_task(local_task_id)
+                        for input in op.inputs:
+                            newTask.add_input(input)
+                        for output in op.outputs:
+                            newTask.add_output(output)
+                        assert(len(op.reductions) == 0)
+                        # Whoops, binop doesn't accept scalar args yet.
+                        # assert(len(op._scalar_args) == 0)
+                        newTask.add_scalar_arg(funcptr, ty.uint64)
+                        newOps.append(newTask)
+                    else:
+                        newOps.append(op)
+                else:
+                    newOps.append(op)
+            ops = newOps
+
         strategies = []
         for op in ops:
             must_be_single = len(op.scalar_outputs) > 0
@@ -1355,6 +1403,25 @@ class Runtime:
                 strategies.append(partitioner.partition_stores())
 
         for op, strategy in zip(ops, strategies):
+            refcnts = []
+            for store in op.inputs:
+                refcnts.append(store._num_external_references)
+            for store in op.outputs:
+                refcnts.append(store._num_external_references)
+            print(op, refcnts)
+            # For now, assume that there isn't any additional information
+            # that we need to provide tasks with generate their task bodies
+            # other than a list of all the stores they access. We can also
+            # assume that the tasks generators don't get to use any information
+            # about the stores other than their data types and number of dimensions.
+            #
+            # TODO (rohany): I actually take that back, it looks like we have to pass
+            #  some extra information to task body generation even for getting binary
+            #  operations to work, since a single binary op definition is used for
+            #  every operation. I'm not sure what the API for this should be. Ideally
+            #  the Python users should be able to pass a blob of bytes through to the
+            #  generator function, which is able to interpret that as whatever is necessary.
+
             with op.target_machine:
                 op.launch(strategy)
 

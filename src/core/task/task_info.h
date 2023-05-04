@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "core/runtime/mlir_decls.h"
 #include "core/task/variant_options.h"
 #include "core/utilities/typedefs.h"
 
@@ -42,6 +43,10 @@ class TaskInfo {
   const VariantInfo* find_variant(LegateVariantCode vid) const;
   bool has_variant(LegateVariantCode vid) const;
 
+  bool has_mlir_variant() const;
+  std::shared_ptr<MLIRTaskBodyGenerator> get_mlir_body_generator() const;
+  void set_mlir_generator(std::unique_ptr<MLIRTaskBodyGenerator> generator);
+
  public:
   void register_task(Legion::TaskID task_id);
 
@@ -49,6 +54,7 @@ class TaskInfo {
   friend std::ostream& operator<<(std::ostream& os, const TaskInfo& info);
   std::string task_name_;
   std::map<LegateVariantCode, VariantInfo> variants_;
+  std::shared_ptr<MLIRTaskBodyGenerator> mlirGenerator_;
 };
 
 }  // namespace legate

@@ -49,7 +49,9 @@ LibraryContext::LibraryContext(const std::string& library_name,
                                std::unique_ptr<mapping::Mapper> mapper)
   : runtime_(Legion::Runtime::get_runtime()),
     library_name_(library_name),
-    mapper_(std::move(mapper))
+    mapper_(std::move(mapper)),
+    // TODO (rohany): For now, let's just hold onto the raw resource config.
+    resource_config_(config)
 {
   task_scope_ = ResourceIdScope(
     runtime_->generate_library_task_ids(library_name.c_str(), config.max_tasks), config.max_tasks);
@@ -79,6 +81,10 @@ Legion::TaskID LibraryContext::get_task_id(int64_t local_task_id) const
 {
   assert(task_scope_.valid());
   return task_scope_.translate(local_task_id);
+}
+
+Legion::TaskID LibraryContext::get_max_preregistered_task_id() const {
+  return this->resource_config_.max_preregistered_task_id;
 }
 
 Legion::ReductionOpID LibraryContext::get_reduction_op_id(int64_t local_redop_id) const

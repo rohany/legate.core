@@ -27,6 +27,12 @@ std::string generate_task_name(const std::type_info&);
 void task_wrapper(
   VariantImpl, const std::string&, const void*, size_t, const void*, size_t, Legion::Processor);
 
+// Also provide a task wrapper not linked to the LegateTask base class.
+template <VariantImpl VARIANT_IMPL>
+void legate_task_wrapper(const void* args, size_t arglen, const void* userdata, size_t userlen, Legion::Processor p) {
+  task_wrapper(VARIANT_IMPL, "TODO (rohany): FILLINTASKNAME", args, arglen, userdata, userlen, p);
+}
+
 };  // namespace detail
 
 template <typename T>
@@ -42,6 +48,15 @@ template <typename T>
   const std::map<LegateVariantCode, VariantOptions>& all_options)
 {
   auto task_info = create_task_info(all_options);
+  T::Registrar::get_registrar().record_task(T::TASK_ID, std::move(task_info));
+}
+
+template <typename T>
+/*static*/ void LegateTask<T>::register_variants(
+  std::unique_ptr<MLIRTaskBodyGenerator> generator,
+  const std::map<LegateVariantCode, VariantOptions>& all_options) {
+  auto task_info = create_task_info(all_options);
+  task_info->set_mlir_generator(std::move(generator));
   T::Registrar::get_registrar().record_task(T::TASK_ID, std::move(task_info));
 }
 

@@ -18,6 +18,7 @@
 #include "core/mapping/core_mapper.h"
 #include "core/mapping/default_mapper.h"
 #include "core/runtime/context.h"
+#include "core/runtime/mlir.h"
 #include "core/runtime/projection.h"
 #include "core/runtime/shard.h"
 #include "core/task/exception.h"
@@ -228,6 +229,14 @@ int32_t Runtime::find_reduction_operator(int32_t type_uid, int32_t op_kind) cons
   return finder->second;
 }
 
+void Runtime::initializeMLIRRuntime() {
+  this->mlirRuntime = std::make_unique<MLIRRuntime>();
+}
+
+MLIRRuntime* Runtime::getMLIRRuntime() {
+  return this->mlirRuntime.get();
+}
+
 /*static*/ Runtime* Runtime::get_runtime()
 {
   static Runtime runtime;
@@ -331,6 +340,10 @@ extern void register_exception_reduction_op(Legion::Runtime* runtime,
 {
   ResourceConfig config;
   config.max_tasks       = LEGATE_CORE_NUM_TASK_IDS;
+  // TODO (rohany): Might have to give legate core more IDs if we end up fusing core tasks?
+  //  Or, i think the right move is to make a new space for fused tasks eventually, since
+  //  they will be cross-mapper anyway.
+  config.max_preregistered_task_id = LEGATE_CORE_NUM_TASK_IDS;
   config.max_projections = LEGATE_CORE_MAX_FUNCTOR_ID;
   // We register one sharding functor for each new projection functor
   config.max_shardings     = LEGATE_CORE_MAX_FUNCTOR_ID;

@@ -35,6 +35,7 @@ from .allocation import (
     InlineMappedAllocation,
 )
 from .legate import Array, Field as LegateField
+from ._lib.context import PyCompileTimeStoreDescriptor
 from .partition import REPLICATE, PartitionBase, Restriction, Tiling
 from .projection import execute_functor_symbolically
 from .runtime import runtime
@@ -927,6 +928,9 @@ class Store:
 
     def move_data(self, other: Store) -> None:
         self._storage.move_data(other._storage)
+
+    def to_comp_time_store_desc(self) -> PyCompileTimeStoreDescriptor:
+        return PyCompileTimeStoreDescriptor(self.ndim, self.type.code)
 
     @property
     def shape(self) -> Shape:

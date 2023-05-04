@@ -205,6 +205,7 @@ list(APPEND legate_core_SOURCES
   src/core/mapping/operation.cc
   src/core/mapping/store.cc
   src/core/runtime/context.cc
+  src/core/runtime/mlir.cc
   src/core/runtime/projection.cc
   src/core/runtime/runtime.cc
   src/core/runtime/shard.cc
@@ -289,6 +290,36 @@ target_compile_definitions(legate_core
   PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${legate_core_CXX_DEFS}>"
          "$<$<COMPILE_LANGUAGE:CUDA>:${legate_core_CUDA_DEFS}>")
 
+# MLIR / LLVM setup.
+find_package(MLIR REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
+
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+message(STATUS "Found MLIR ${MLIR_PACKAGE_VERSION}")
+message(STATUS "Using MLIR.cmake in: ${MLIR_DIR}")
+
+target_include_directories(legate_core PUBLIC ${LLVM_INCLUDE_DIRS})
+target_include_directories(legate_core PUBLIC ${MLIR_INCLUDE_DIRS})
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
+llvm_map_components_to_libnames(llvm_libs support core)
+target_link_libraries(legate_core
+ PRIVATE
+   ${dialect_libs}
+   ${conversion_libs}
+   ${llvm_libs}
+   MLIRIR
+   MLIROptLib
+   MLIRSupport
+   MLIRParser
+   MLIRPass
+   MLIRTransforms
+   MLIRExecutionEngine
+)
+# TODO (rohany): See if we need -fno-rtti.
+
+
 target_include_directories(legate_core
   PUBLIC
     $<BUILD_INTERFACE:${legate_core_SOURCE_DIR}/src>
@@ -336,6 +367,8 @@ if (legate_core_BUILD_DOCS)
       src/core/runtime/runtime.h
       src/core/runtime/runtime.inl
       src/core/runtime/context.h
+      src/core/runtime/mlir.h
+      src/core/runtime/mlir_decls.h
       # mapping
       src/core/mapping/mapping.h
       src/core/mapping/operation.h
@@ -420,6 +453,8 @@ install(
 install(
   FILES src/core/runtime/context.h
         src/core/runtime/context.inl
+        src/core/runtime/mlir.h
+        src/core/runtime/mlir_decls.h
         src/core/runtime/resource.h
         src/core/runtime/runtime.h
         src/core/runtime/runtime.inl

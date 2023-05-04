@@ -14,6 +14,7 @@
  *
  */
 
+#include "core/runtime/mlir.h"
 #include "core/task/task_info.h"
 
 namespace legate {
@@ -66,6 +67,20 @@ void TaskInfo::register_task(Legion::TaskID task_id)
     runtime->register_task_variant(
       registrar, vinfo.code_desc, nullptr, 0, vinfo.options.return_size, vid);
   }
+}
+
+bool TaskInfo::has_mlir_variant() const {
+  return this->mlirGenerator_.get() != nullptr;
+}
+
+std::shared_ptr<MLIRTaskBodyGenerator> TaskInfo::get_mlir_body_generator() const {
+  assert(this->has_mlir_variant());
+  return this->mlirGenerator_;
+}
+
+void TaskInfo::set_mlir_generator(std::unique_ptr<MLIRTaskBodyGenerator> generator) {
+  assert(!this->has_mlir_variant());
+  this->mlirGenerator_ = std::move(generator);
 }
 
 std::ostream& operator<<(std::ostream& os, const VariantInfo& info)

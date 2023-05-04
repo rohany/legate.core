@@ -443,6 +443,8 @@ def install(
 -DLegion_BUILD_BINDINGS=ON
 -DLegion_BUILD_JUPYTER=ON
 -DLegion_EMBED_GASNet_CONFIGURE_ARGS="--with-ibv-max-hcas=8"
+-DLLVM_DIR=/Users/rohany/Documents/research/llvm/install/lib/cmake/llvm/
+-DMLIR_DIR=/Users/rohany/Documents/research/llvm/install/lib/cmake/mlir/
 """.splitlines()
 
     if nccl_dir:

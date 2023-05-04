@@ -236,5 +236,14 @@ class LegateRuntimeSettings(Settings):
         """,
     )
 
+    kernel_fusion: EnvOnlySetting[bool] = EnvOnlySetting(
+        "kernel_fusion",
+        "LEGATE_KERNEL_FUSION",
+        default=False,
+        test_default=False,
+        convert=convert_bool,
+        help="Enable kernel fusion with MLIR",
+    )
+
 
 settings = LegateRuntimeSettings()
