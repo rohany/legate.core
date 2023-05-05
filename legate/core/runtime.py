@@ -989,6 +989,42 @@ class CommunicatorManager:
         return self._cpu is not None
 
 
+class GeneratedTaskDescriptor:
+    def __init__(self, global_id, inputs, outputs, reducs):
+        self._id = global_id
+        self._inputs = tuple(inputs)
+        self._outputs = tuple(outputs)
+        self._reducs = tuple(reducs)
+        self._hash = None
+
+    def __hash__(self) -> int:
+        if self._hash is not None:
+            return self._hash
+
+        self._hash = hash((
+            self._id,
+            self._inputs,
+            self._outputs,
+            self._reducs,
+        ))
+        return self._hash
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, GeneratedTaskDescriptor)
+            and self._id == other._id
+            and self._inputs == other._inputs
+            and self._outputs == other._outputs
+            and self._reducs == other._reducs
+        )
+
+    def __str__(self) -> str:
+        return f"({self._id}, {self._inputs}, {self._outputs}, {self._reducs}, {self._hash})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class Runtime:
     _legion_runtime: Union[legion.legion_runtime_t, None]
     _legion_context: Union[legion.legion_context_t, None]
@@ -1137,6 +1173,10 @@ class Runtime:
     @property
     def has_cpu_communicator(self) -> bool:
         return self._comm_manager.has_cpu_communicator
+
+        # Maintain a cache of generated kernels, holding the function
+        # pointer to use for the kernel.
+        self._generated_kernel_cache: dict[GeneratedTaskDescriptor, tuple[int, int]] = {}
 
     @property
     def legion_runtime(self) -> legion.legion_runtime_t:
@@ -1345,53 +1385,11 @@ class Runtime:
 
     def _schedule(self, ops: List[Operation]) -> None:
         from .solver import Partitioner
+        from .operation import AutoTask
 
         # TODO: For now we run the partitioner for each operation separately.
         #       We will eventually want to compute a trace-wide partitioning
         #       strategy.
-
-        # TODO (rohany): For now, we're just trying to JIT individual tasks,
-        #  so create the new tasks and then partition them, as it seems like
-        #  I can't directly re-use the partition symbols from the existing
-        #  strategy.
-
-        if settings.kernel_fusion():
-            from .operation import AutoTask
-            newOps = []
-            for op in ops:
-                if isinstance(op, AutoTask):
-                    tid = op._task_id
-                    info = op.context._cpp_context.find_task(tid)
-                    assert(info.valid)
-                    has_mlir = info.has_mlir_variant()
-                    if has_mlir:
-                        gen = info.get_mlir_body_generator()
-                        module = gen.generate_body(
-                            [s.to_comp_time_store_desc() for s in op.inputs],
-                            [s.to_comp_time_store_desc() for s in op.outputs],
-                            [s[0].to_comp_time_store_desc() for s in op.reductions],
-                        )
-                        module.dump()
-                        module.lowerToLLVMDialect()
-                        funcptr = module.jitToLLVM()
-                        local_task_id = op.context.get_fresh_local_task_id()
-                        PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id))
-                        # Now construct a new AutoTask using this ID.
-                        newTask = op.context.create_auto_task(local_task_id)
-                        for input in op.inputs:
-                            newTask.add_input(input)
-                        for output in op.outputs:
-                            newTask.add_output(output)
-                        assert(len(op.reductions) == 0)
-                        # Whoops, binop doesn't accept scalar args yet.
-                        # assert(len(op._scalar_args) == 0)
-                        newTask.add_scalar_arg(funcptr, ty.uint64)
-                        newOps.append(newTask)
-                    else:
-                        newOps.append(op)
-                else:
-                    newOps.append(op)
-            ops = newOps
 
         strategies = []
         for op in ops:
@@ -1402,26 +1400,80 @@ class Runtime:
             with op.target_machine:
                 strategies.append(partitioner.partition_stores())
 
-        for op, strategy in zip(ops, strategies):
-            refcnts = []
-            for store in op.inputs:
-                refcnts.append(store._num_external_references)
-            for store in op.outputs:
-                refcnts.append(store._num_external_references)
-            print(op, refcnts)
-            # For now, assume that there isn't any additional information
-            # that we need to provide tasks with generate their task bodies
-            # other than a list of all the stores they access. We can also
-            # assume that the tasks generators don't get to use any information
-            # about the stores other than their data types and number of dimensions.
-            #
-            # TODO (rohany): I actually take that back, it looks like we have to pass
-            #  some extra information to task body generation even for getting binary
-            #  operations to work, since a single binary op definition is used for
-            #  every operation. I'm not sure what the API for this should be. Ideally
-            #  the Python users should be able to pass a blob of bytes through to the
-            #  generator function, which is able to interpret that as whatever is necessary.
+        # Try to replace tasks by JIT-ed variants, and remap the partitioning
+        # strategy of the tasks over to the newly created task.
+        for i in range(len(ops)):
+            op, strategy = ops[i], strategies[i]
+            if not settings.kernel_fusion():
+                continue
+            if not isinstance(op, AutoTask):
+                continue
 
+            tid = op._task_id
+            info = op.context._cpp_context.find_task(tid)
+            assert(info.valid)
+            if not info.has_mlir_variant():
+                continue
+
+            gen = info.get_mlir_body_generator()
+            inputs = [s.to_comp_time_store_desc() for s in op.inputs]
+            outputs = [s.to_comp_time_store_desc() for s in op.outputs]
+            reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
+            desc = GeneratedTaskDescriptor(op.context.get_task_id(tid), inputs, outputs, reducs)
+            if desc in self._generated_kernel_cache:
+                local_task_id, funcptr = self._generated_kernel_cache[desc]
+            else:
+                # For now, assume that there isn't any additional information
+                # that we need to provide tasks with generate their task bodies
+                # other than a list of all the stores they access. We can also
+                # assume that the tasks generators don't get to use any information
+                # about the stores other than their data types and number of dimensions.
+                #
+                # TODO (rohany): I actually take that back, it looks like we have to pass
+                #  some extra information to task body generation even for getting binary
+                #  operations to work, since a single binary op definition is used for
+                #  every operation. I'm not sure what the API for this should be. Ideally
+                #  the Python users should be able to pass a blob of bytes through to the
+                #  generator function, which is able to interpret that as whatever is necessary.
+                module = gen.generate_body(inputs, outputs, reducs)
+                module.lowerToLLVMDialect()
+                funcptr = module.jitToLLVM()
+                local_task_id = op.context.get_fresh_local_task_id()
+                PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id))
+                self._generated_kernel_cache[desc] = (local_task_id, funcptr)
+            # Now construct a new AutoTask using this ID.
+            newTask = op.context.create_auto_task(local_task_id)
+            for input in op.inputs:
+                newTask.add_input(input)
+            for output in op.outputs:
+                newTask.add_output(output)
+            assert(len(op.reductions) == 0)
+            # TODO (rohany): Whoops, binop doesn't accept scalar args yet.
+            # assert(len(op._scalar_args) == 0)
+            newTask.add_scalar_arg(funcptr, ty.uint64)
+            ops[i] = newTask
+
+            # Now remap the partition symbols over to the task.
+            part_sym_mapping = {}
+            for src, dest in zip(op._input_parts, newTask._input_parts):
+                part_sym_mapping[src] = dest
+            for src, dest in zip(op._output_parts, newTask._output_parts):
+                part_sym_mapping[src] = dest
+            # TODO (rohany): Do the reduction parts here.
+
+            strategies[i] = strategy.remap(part_sym_mapping)
+
+
+
+        for op, strategy in zip(ops, strategies):
+            # TODO (rohany): Some old code to ensure that library reference
+            #  counting works.
+            # refcnts = []
+            # for store in op.inputs:
+            #     refcnts.append(store._num_external_references)
+            # for store in op.outputs:
+            #     refcnts.append(store._num_external_references)
+            # print(op, refcnts)
             with op.target_machine:
                 op.launch(strategy)
 

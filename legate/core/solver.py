@@ -73,6 +73,23 @@ class EqClass(Generic[T]):
         self._classes[cls_id1] = new_cls
         self._classes[cls_id2] = new_cls
 
+    def remap(self, mapping: dict[T, T]) -> EqClass[T]:
+        def map(val: T) -> T:
+            if val in mapping:
+                return mapping[val]
+            return val
+        new_classes: dict[int, OrderedSet[T]] = {}
+        for k, s in self._classes.items():
+            new_set: OrderedSet[T] = OrderedSet()
+            for val in s:
+                new_set.add(map(val))
+            new_classes[k] = s
+        result = EqClass()
+        result._class_ids = self._class_ids
+        result._next_class_id = self._next_class_id
+        result._classes = new_classes
+        return result
+
     def record(self, var1: T, var2: T) -> None:
         """
         Record an equivalence relation between two vars
@@ -185,6 +202,21 @@ class Strategy:
         non_members = {part1, part2} - self._key_parts
         if len(non_members) == 1:
             self._key_parts.update(non_members)
+
+    # Remap a strategy to a new set of partition symbols.
+    # TODO (rohany): I'm unsure if we'll actually need this. We might
+    #  need a "merge" function that takes in multiple strategies.
+    def remap(self, mapping: dict[PartSym, PartSym]) -> Strategy:
+        def map(sym: PartSym) -> PartSym:
+            if sym in mapping:
+                return mapping[sym]
+            return sym
+        new_strategy = {map(sym): part for sym, part in self._strategy.items()}
+        new_fspaces = {map(sym): fspace for sym, fspace in self._fspaces.items()}
+        new_key_parts = {map(sym) for sym in self._key_parts}
+        new_eq_classes = self._eq_classes.remap(mapping)
+        new_launch_domain = self._launch_domain.hi if self._launch_domain is not None else None
+        return Strategy(new_launch_domain, new_strategy, new_fspaces, new_key_parts, new_eq_classes)
 
     def __str__(self) -> str:
         st = "[Strategy]"

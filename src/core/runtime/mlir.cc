@@ -351,9 +351,6 @@ StridedMemRefType<T, N> accessorToMemRef(ACC acc, Legion::Rect<N> bounds) {
 
 /* static */
 void MLIRTask::body(TaskContext& context) {
-  // TODO (rohany): Here is where we unpack things from the context, turn them into
-  //  memref types, and then call the packed function.
-
   auto& inputs = context.inputs();
   auto& outputs = context.outputs();
   auto& reducs = context.reductions();
@@ -364,12 +361,8 @@ void MLIRTask::body(TaskContext& context) {
   //  passing scalars to the tasks yet.
   assert(scalars.size() == 1);
 
-  // TODO (rohany): To make progress for now, let's just define a type of function
-  //  pointer, and make the calls for that...
   typedef void (*func_t) (void**);
   auto func = scalars[0].value<func_t>();
-
-  std::cout << "LEGATE FUNCPTR " << reinterpret_cast<uint64_t>(func) << std::endl;
 
   // TODO (rohany): Generating the body would also allow us to not malloc
   //  a bunch of times on each task invocation...
