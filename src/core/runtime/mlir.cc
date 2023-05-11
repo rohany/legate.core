@@ -38,11 +38,14 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "mlir/Transforms/Passes.h"
 
 #include <iostream>
 
@@ -233,7 +236,13 @@ static void setupTargetTripleAndDataLayout(llvm::Module *llvmModule,
   llvmModule->setTargetTriple(tm->getTargetTriple().getTriple());
 }
 
-MLIRModule::MLIRModule(mlir::OwningOpRef<mlir::ModuleOp> module, const std::string& kernelName) : module_(std::move(module)), kernelName_(kernelName) {}
+MLIRModule::MLIRModule(
+  mlir::OwningOpRef<mlir::ModuleOp> module,
+  const std::string& kernelName,
+  const std::vector<CompileTimeStoreDescriptor>& inputs,
+  const std::vector<CompileTimeStoreDescriptor>& outputs,
+  const std::vector<CompileTimeStoreDescriptor>& reducs
+  ) : module_(std::move(module)), kernelName_(kernelName), inputs_(inputs), outputs_(outputs), reducs_(reducs) {}
 
 void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
   // TODO (rohany): Eventually, this will need to accept input from individual
@@ -309,11 +318,144 @@ void MLIRModule::dump(MLIRRuntime* runtime) {
   runtime->dumpMLIR(this->module_.get());
 }
 
+/* static */
+std::unique_ptr<MLIRModule> MLIRModule::fuseModules(
+  MLIRRuntime* runtime,
+  const std::string& kernelName,
+  const std::vector<MLIRModule*>& modules,
+  const std::vector<CompileTimeStoreDescriptor>& inputs,
+  const std::vector<CompileTimeStoreDescriptor>& outputs,
+  const std::vector<CompileTimeStoreDescriptor>& reducs,
+  const std::map<int64_t, int32_t>& storeIDToIndexMapping
+) {
+  auto ctx = runtime->getContext().get();
+
+  mlir::OpBuilder builder(ctx);
+  mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(builder.getUnknownLoc());
+  builder.setInsertionPointToEnd(module->getBody());
+  auto loc = mlir::NameLoc::get(mlir::StringAttr::get(ctx, "fused_task"));
+
+  llvm::SmallVector<mlir::Type, 8> funcTypeArgs;
+  for (auto store : inputs) { funcTypeArgs.push_back(buildMemRefTypeOfDim(ctx, store.ndim, store.typ)); }
+  for (auto store : outputs) { funcTypeArgs.push_back(buildMemRefTypeOfDim(ctx, store.ndim, store.typ)); }
+  for (auto store : reducs) { funcTypeArgs.push_back(buildMemRefTypeOfDim(ctx, store.ndim, store.typ)); }
+  auto funcType = builder.getFunctionType(funcTypeArgs, std::nullopt);
+  // TODO (rohany): I should make this a static attribute or something, because it's used everywhere.
+  mlir::NamedAttribute namedAttr(mlir::StringAttr::get(ctx, "llvm.emit_c_interface"), mlir::UnitAttr::get(ctx));
+  // TODO (rohany): There's some trickiness I need to figure out here because I want the module to
+  //  be "always valid", as in I could always lower it to LLVM and execute it, but I need temporary
+  //  names for the functions I create as temporaries. Another option is to just writes passes that
+  //  consume and modify this function, rather than creating new ones?
+  auto func = builder.create<mlir::func::FuncOp>(loc, kernelName, funcType, std::vector<mlir::NamedAttribute>{namedAttr});
+  auto block = func.addEntryBlock();
+  builder.setInsertionPointToStart(block);
+
+  mlir::IRMapping argumentMapper;
+  for (auto mlirModule : modules) {
+    auto& taskModule = mlirModule->module_;
+    // There should only be a single function inside each of the modules.
+    auto func = *taskModule->getOps<mlir::func::FuncOp>().begin();
+    auto& funcBlocks = func.getBlocks();
+    auto& header = funcBlocks.front();
+
+    // Map all of the arguments of each task to the corresponding arguments
+    // of the fused task.
+    size_t index = 0;
+    for (auto& store : mlirModule->inputs_) {
+      argumentMapper.map(header.getArgument(index), block->getArgument(storeIDToIndexMapping.at(store.id)));
+      index++;
+    }
+    for (auto& store : mlirModule->outputs_) {
+      argumentMapper.map(header.getArgument(index), block->getArgument(storeIDToIndexMapping.at(store.id)));
+      index++;
+    }
+    for (auto& store : mlirModule->reducs_) {
+      argumentMapper.map(header.getArgument(index), block->getArgument(storeIDToIndexMapping.at(store.id)));
+      index++;
+    }
+
+    // Copy all of the instructions from the task to the fused task.
+    for (auto& funcBlock : funcBlocks) {
+      for (auto& inst : funcBlock) {
+        // We don't want to to include the return at the end of each task
+        // in the resulting fused task.
+        if (!mlir::isa<mlir::func::ReturnOp>(inst)) {
+          builder.clone(inst, argumentMapper);
+        }
+      }
+    }
+
+    // Clear the argumentMapper for the next task.
+    argumentMapper.clear();
+  }
+  // After all of the task bodies are copied over, include a return to terminate
+  // the fused function.
+  builder.create<mlir::func::ReturnOp>(loc);
+
+  return std::make_unique<MLIRModule>(std::move(module), kernelName, inputs, outputs, reducs);
+}
+
+void MLIRModule::promoteTemporaryStores(
+  MLIRRuntime* runtime,
+  const std::vector<int32_t>& temporaryStoreOrdinals,
+  const std::vector<int32_t>& resolutionOrdinalMapping
+) {
+  auto ctx = runtime->getContext().get();
+  mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
+  mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
+  funcsPM.addPass(std::make_unique<TemporaryStorePromotionPass>(temporaryStoreOrdinals, resolutionOrdinalMapping));
+  if (mlir::failed(pm.run(this->module_.get()))) {
+    assert(false);
+  }
+
+  // Remove the temporary stores from the module's metadata as well.
+  std::set<int32_t> tempOrdinals(temporaryStoreOrdinals.begin(), temporaryStoreOrdinals.end());
+  std::vector<CompileTimeStoreDescriptor> newInputs, newOutputs, newReducs;
+  size_t idx = 0;
+  for (size_t i = 0; i < this->inputs_.size(); i++) {
+    if (tempOrdinals.count(idx) == 0) {
+      newInputs.push_back(this->inputs_[i]);
+    }
+    idx++;
+  }
+  for (size_t i = 0; i < this->outputs_.size(); i++) {
+    if (tempOrdinals.count(idx) == 0) {
+      newOutputs.push_back(this->outputs_[i]);
+    }
+    idx++;
+  }
+  for (size_t i = 0; i < this->reducs_.size(); i++) {
+    if (tempOrdinals.count(idx) == 0) {
+      newReducs.push_back(this->reducs_[i]);
+    }
+    idx++;
+  }
+  this->inputs_ = newInputs;
+  this->outputs_ = newOutputs;
+  this->reducs_ = newReducs;
+}
+
+void MLIRModule::optimize(MLIRRuntime* runtime) {
+  auto ctx = runtime->getContext().get();
+  mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
+  mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
+  funcsPM.addPass(mlir::createCSEPass());
+  funcsPM.addPass(mlir::createLoopFusionPass(0, 0, true, mlir::FusionMode::Greedy));
+  funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+  funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+
+  // pm.enableIRPrinting();
+
+  if (mlir::failed(pm.run(this->module_.get()))) {
+    assert(false);
+  }
+}
+
 MLIRTaskBodyGenerator::~MLIRTaskBodyGenerator() {}
 
-CompileTimeStoreDescriptor::CompileTimeStoreDescriptor() : ndim(0), typ(LegateTypeCode::MAX_TYPE_NUMBER) {}
+CompileTimeStoreDescriptor::CompileTimeStoreDescriptor() : ndim(0), typ(LegateTypeCode::MAX_TYPE_NUMBER), id(0) {}
 
-CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ) : ndim(ndim), typ(typ) {}
+CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ, int64_t id) : ndim(ndim), typ(typ), id(id) {}
 
 /* static */
 void MLIRTask::register_variant(std::string& name, int task_id) {
@@ -329,11 +471,6 @@ void MLIRTask::register_variant(std::string& name, int task_id) {
   }
 }
 
-/* static */
-// void MLIRTask::cpu_variant(TaskContext& context) {
-//   // TODO (rohany): I should be able to use the core's wrapper here...
-// }
-
 template<typename ACC, typename T, int N>
 StridedMemRefType<T, N> accessorToMemRef(ACC acc, Legion::Rect<N> bounds) {
   StridedMemRefType<T, N> memref{};
@@ -348,6 +485,24 @@ StridedMemRefType<T, N> accessorToMemRef(ACC acc, Legion::Rect<N> bounds) {
   }
   return memref;
 }
+
+struct AccessorToMemrefDescAlloc {
+  template<LegateTypeCode CODE, int DIM>
+  void* operator()(const Store& store, bool read) {
+    using T = legate_type_of<CODE>;
+    StridedMemRefType<T, DIM> memref;
+    if (read) {
+      auto acc = store.read_accessor<T, DIM>();
+      memref = accessorToMemRef<decltype(acc), T, DIM>(acc, store.shape<DIM>());
+    } else {
+      auto acc = store.write_accessor<T, DIM>();
+      memref = accessorToMemRef<decltype(acc), T, DIM>(acc, store.shape<DIM>());
+    }
+    auto argPtr = static_cast<StridedMemRefType<T, DIM>*>(malloc(sizeof(decltype(memref))));
+    *argPtr = memref;
+    return argPtr;
+  }
+};
 
 /* static */
 void MLIRTask::body(TaskContext& context) {
@@ -372,21 +527,7 @@ void MLIRTask::body(TaskContext& context) {
   auto addStoreToArgs = [&](const Store& store, bool read) {
     // TODO (rohany): Not handling transforms right now.
     assert(!store.transformed());
-    // TODO (rohany): Not handling other types for now.
-    assert(store.code() == LegateTypeCode::DOUBLE_LT);
-    // TODO (rohany): Not handling other dimensions for now.
-    assert(store.dim() == 1);
-
-    StridedMemRefType<double, 1> memref;
-    if (read) {
-      auto acc = store.read_accessor<double, 1>();
-      memref = accessorToMemRef<decltype(acc), double, 1>(acc, store.shape<1>());
-    } else {
-      auto acc = store.write_accessor<double, 1>();
-      memref = accessorToMemRef<decltype(acc), double, 1>(acc, store.shape<1>());
-    }
-    auto argPtr = static_cast<std::add_pointer<decltype(memref)>::type>(malloc(sizeof(decltype(memref))));
-    *argPtr = memref;
+    auto argPtr = double_dispatch(store.dim(), store.code(), AccessorToMemrefDescAlloc{}, store, read);
     argData.push_back(argPtr);
   };
 

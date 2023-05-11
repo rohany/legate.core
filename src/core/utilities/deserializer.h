@@ -108,6 +108,11 @@ class TaskDeserializer : public BaseDeserializer<TaskDeserializer> {
   std::vector<Legion::OutputRegion> outputs_;
 };
 
+class SimpleDeserializer : public BaseDeserializer<SimpleDeserializer> {
+  public:
+    SimpleDeserializer(const int8_t* args, size_t arglen);
+};
+
 namespace mapping {
 
 class MapperDataDeserializer : public BaseDeserializer<MapperDataDeserializer> {

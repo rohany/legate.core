@@ -17,11 +17,12 @@ import cython
 from typing import List
 
 from libcpp cimport bool
+from libcpp.map cimport map
 from libcpp.memory cimport unique_ptr, shared_ptr
 from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
-from libc.stdint cimport uintptr_t
+from libc.stdint cimport uintptr_t, int32_t, int64_t
 
 
 cdef extern from "core/legate_c.h" nogil:
@@ -49,12 +50,31 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
         void lowerToLLVMDialect(MLIRRuntime*)
         void dump(MLIRRuntime*)
         uintptr_t jitToLLVM(MLIRRuntime*)
+        @staticmethod
+        unique_ptr[MLIRModule] fuseModules(
+          MLIRRuntime*,
+          const string&,
+          const vector[MLIRModule*]& modules,
+          const vector[CompileTimeStoreDescriptor]&,
+          const vector[CompileTimeStoreDescriptor]&,
+          const vector[CompileTimeStoreDescriptor]&,
+          const map[int64_t, int32_t]&
+        )
+        void promoteTemporaryStores(
+          MLIRRuntime*,
+          const vector[int32_t]&,
+          const vector[int32_t]&
+        )
+        void optimize(MLIRRuntime*)
+
+    ctypedef MLIRModule* MLIRModulePtr
 
     cdef cppclass CompileTimeStoreDescriptor:
         CompileTimeStoreDescriptor()
-        CompileTimeStoreDescriptor(int, legate_core_type_code_t)
-        int ndim
+        CompileTimeStoreDescriptor(int32_t, legate_core_type_code_t, int64_t)
+        int32_t ndim
         legate_core_type_code_t typ
+        int64_t id
 
 
     cdef cppclass MLIRTaskBodyGenerator:
@@ -63,7 +83,9 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
           const string&,
           const vector[CompileTimeStoreDescriptor]&,
           const vector[CompileTimeStoreDescriptor]&,
-          const vector[CompileTimeStoreDescriptor]&
+          const vector[CompileTimeStoreDescriptor]&,
+          char*,
+          int32_t
         )
 
 cdef extern from "core/runtime/context.h" namespace "legate" nogil:
@@ -88,11 +110,11 @@ cdef extern from "core/runtime/runtime.h" namespace "legate" nogil:
 cdef class PyCompileTimeStoreDescriptor:
     cdef CompileTimeStoreDescriptor desc
 
-    def __init__(self, int ndim, legate_core_type_code_t typ):
-        self.desc = CompileTimeStoreDescriptor(ndim, typ)
+    def __init__(self, int ndim, legate_core_type_code_t typ, int id):
+        self.desc = CompileTimeStoreDescriptor(ndim, typ, id)
 
     def __str__(self):
-        return f"CompileTimeStoreDescriptor({self.desc.ndim}, {self.desc.typ})"
+        return f"CompileTimeStoreDescriptor({self.desc.ndim}, {self.desc.typ}, {self.desc.id})"
 
     def __repr__(self):
         return self.__str__()
@@ -104,6 +126,16 @@ cdef class PyCompileTimeStoreDescriptor:
     @property
     def typ(self) -> legate_core_type_code_t:
         return self.desc.typ
+
+    @property
+    def id(self) -> int:
+        return self.desc.id
+
+    # The ID is something used during code generation to disambiguate
+    # different stores while compiling an individual set of tasks. However,
+    # I don't plan on using the ID as part of the fingerprint when deciding
+    # if a particular trace can be replayed or something. Therefore, it is
+    # excluded from the hash and equality functions.
 
     def __hash__(self) -> int:
         return hash((self.desc.ndim, self.desc.typ))
@@ -131,11 +163,13 @@ cdef class PyMLIRModule:
         shared_ptr[MLIRTaskBodyGenerator] gen,
         vector[CompileTimeStoreDescriptor]& inputs,
         vector[CompileTimeStoreDescriptor]& outputs,
-        vector[CompileTimeStoreDescriptor]& reducs
+        vector[CompileTimeStoreDescriptor]& reducs,
+        char* buffer,
+        int32_t buflen,
     ):
         cdef int funcID = runtime.getNextJITID()
         cdef str kernelName = "legateMLIRKernel" + str(funcID)
-        cdef unique_ptr[MLIRModule] module = gen.get().generate_body(runtime, kernelName.encode(), inputs, outputs, reducs)
+        cdef unique_ptr[MLIRModule] module = gen.get().generate_body(runtime, kernelName.encode(), inputs, outputs, reducs, buffer, buflen)
         return PyMLIRModule.from_unique_ptr(move(module))
 
     def lowerToLLVMDialect(self):
@@ -149,6 +183,69 @@ cdef class PyMLIRModule:
     def jitToLLVM(self) -> uintptr_t:
         runtime = Runtime.get_runtime().getMLIRRuntime()
         return self._module.get().jitToLLVM(runtime)
+
+    @staticmethod
+    def construct_fused_module(
+        list modules,
+        list input_stores,
+        list output_stores,
+        list reduc_stores,
+        dict store_id_to_index_mapping
+    ) -> PyMLIRModule:
+        cdef vector[MLIRModule*] module_ptrs = vector[MLIRModulePtr](len(modules))
+        cdef vector[CompileTimeStoreDescriptor] inputs = vector[CompileTimeStoreDescriptor](len(input_stores))
+        cdef vector[CompileTimeStoreDescriptor] outputs = vector[CompileTimeStoreDescriptor](len(output_stores))
+        cdef vector[CompileTimeStoreDescriptor] reducs = vector[CompileTimeStoreDescriptor](len(reduc_stores))
+        cdef map[int64_t, int32_t] store_id_to_index = map[int64_t, int32_t]();
+
+        # Copy over all of the store descriptors into the C++ vectors.
+        cdef int i
+        for i in range(len(input_stores)):
+          inputs[i] = (<PyCompileTimeStoreDescriptor?>input_stores[i]).desc
+        for i in range(len(output_stores)):
+          outputs[i] = (<PyCompileTimeStoreDescriptor?>output_stores[i]).desc
+        for i in range(len(reduc_stores)):
+          reducs[i] = (<PyCompileTimeStoreDescriptor?>reduc_stores[i]).desc
+        for i in range(len(modules)):
+          module_ptrs[i] = (<PyMLIRModule?>modules[i])._module.get()
+
+        # Also convert the mapping into a C++ object.
+        for id, idx in store_id_to_index_mapping.items():
+          store_id_to_index[id] = idx
+
+        # TODO (rohany): If this ends up being used in one more place, we'll extract
+        #  it into a method somewhere else.
+        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
+        cdef int funcID = runtime.getNextJITID()
+        cdef str kernelName = "legateMLIRKernel" + str(funcID)
+        cdef unique_ptr[MLIRModule] result = MLIRModule.fuseModules(
+          runtime,
+          kernelName.encode(),
+          module_ptrs,
+          inputs,
+          outputs,
+          reducs,
+          store_id_to_index
+        )
+        return PyMLIRModule.from_unique_ptr(move(result))
+
+    def promoteTemporaryStores(
+        self,
+        list temporary_store_ordinals,
+        list resolved_shape_ordinals
+    ) -> None:
+        cdef vector[int32_t] temporary_store_ordinals_ = vector[int32_t](len(temporary_store_ordinals))
+        cdef vector[int32_t] resolved_shape_ordinals_ = vector[int32_t](len(resolved_shape_ordinals))
+        cdef int i
+        for i in range(len(temporary_store_ordinals)):
+          temporary_store_ordinals_[i] = temporary_store_ordinals[i]
+          resolved_shape_ordinals_[i] = resolved_shape_ordinals_[i]
+        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
+        self._module.get().promoteTemporaryStores(runtime, temporary_store_ordinals_, resolved_shape_ordinals_)
+
+    def optimize(self) -> None:
+        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
+        self._module.get().optimize(runtime)
 
 
 cdef class PyMLIRTask:
@@ -166,36 +263,22 @@ cdef class PyMLIRTaskBodyGenerator:
         result._gen = gen
         return result
 
-    def generate_body(self, list input_stores, list output_stores, list reduc_stores) -> PyMLIRModule:
+    def generate_body(self, list input_stores, list output_stores, list reduc_stores, bytes buffer, int buflen) -> PyMLIRModule:
         cdef vector[CompileTimeStoreDescriptor] inputs = vector[CompileTimeStoreDescriptor](len(input_stores))
         cdef vector[CompileTimeStoreDescriptor] outputs = vector[CompileTimeStoreDescriptor](len(output_stores))
         cdef vector[CompileTimeStoreDescriptor] reducs = vector[CompileTimeStoreDescriptor](len(reduc_stores))
 
-        # TODO (rohany): I don't see a way around the following kind of code:
-        #  Because this is a "def", not a "cdef", we're interfacing with arbitrary
-        #  Python code, with no typing gaurantees. Therefore, we can't use the fact
-        #  that the PyCompileTimeStoreDescriptor has a CompileTimeStoreDescriptor
-        #  inside of it, and just invoke the copy constructor. Instead, we have to
-        #  reference all of the necessary fields ourselves, and use the constructor
-        #  ourself here. This isn't the end of the world, as Cython will tell us
-        #  when the Constructor changes, but it's annoying that we can't just say
-        #  `inputs[i] = input_stores[i]`.
         cdef int i
         for i in range(len(input_stores)):
-          desc = input_stores[i]
-          inputs[i] = CompileTimeStoreDescriptor(desc.ndim, desc.typ)
+          inputs[i] = (<PyCompileTimeStoreDescriptor?>input_stores[i]).desc
         for i in range(len(output_stores)):
-          desc = output_stores[i]
-          outputs[i] = CompileTimeStoreDescriptor(desc.ndim, desc.typ)
+          outputs[i] = (<PyCompileTimeStoreDescriptor?>output_stores[i]).desc
         for i in range(len(reduc_stores)):
-          desc = reduc_stores[i]
-          reducs[i] = CompileTimeStoreDescriptor(desc.ndim, desc.typ)
+          reducs[i] = (<PyCompileTimeStoreDescriptor?>reduc_stores[i]).desc
 
         cdef Runtime* runtime = Runtime.get_runtime()
         cdef MLIRRuntime* mlirRuntime = runtime.getMLIRRuntime()
-
-        # Construct the name for the next kernel.
-        return PyMLIRModule.generate_module(mlirRuntime, self._gen, inputs, outputs, reducs)
+        return PyMLIRModule.generate_module(mlirRuntime, self._gen, inputs, outputs, reducs, buffer, buflen)
 
 
 cdef extern from "core/task/task_info.h" namespace "legate" nogil:

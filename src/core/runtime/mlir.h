@@ -34,8 +34,10 @@
 // TODO (rohany): I don't know if this is the right include to use.
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/Pass.h"
 
 #include "core/runtime/context.h"
+#include "core/runtime/mlir_passes.h"
 #include "core/utilities/typedefs.h"
 
 namespace legate {
@@ -80,7 +82,25 @@ class MLIRRuntime {
 // simplifying interoperation with Python.
 class MLIRModule {
   public:
-    MLIRModule(mlir::OwningOpRef<mlir::ModuleOp> module, const std::string& kernelName);
+    MLIRModule(
+      mlir::OwningOpRef<mlir::ModuleOp> module,
+      const std::string& kernelName,
+      const std::vector<CompileTimeStoreDescriptor>& inputs,
+      const std::vector<CompileTimeStoreDescriptor>& outputs,
+      const std::vector<CompileTimeStoreDescriptor>& reducs
+    );
+
+    static std::unique_ptr<MLIRModule> fuseModules(
+      MLIRRuntime* runtime,
+      const std::string& kernelName,
+      // TODO (rohany): I don't want to make this raw pointers, but Cython
+      //  doesn't have support for reference_wrapper yet.
+      const std::vector<MLIRModule*>& modules,
+      const std::vector<CompileTimeStoreDescriptor>& inputs,
+      const std::vector<CompileTimeStoreDescriptor>& outputs,
+      const std::vector<CompileTimeStoreDescriptor>& reducs,
+      const std::map<int64_t, int32_t>& storeIDToIndexMapping
+    );
  public:
     // TODO (rohany): This is not the final view of what this function
     //  may look like, but it's something to keep pushing the protoype
@@ -88,19 +108,39 @@ class MLIRModule {
     void lowerToLLVMDialect(MLIRRuntime* runtime);
     void dump(MLIRRuntime* runtime);
 
+    // TODO (rohany): Comment...
+    void promoteTemporaryStores(
+      MLIRRuntime* runtime,
+      const std::vector<int32_t>& temporaryStoreOrdinals,
+      const std::vector<int32_t>& resolutionOrdinalMapping
+    );
+
+    // TODO (rohany): Run a couple passes on this module. In the future this
+    //  will be opt in by different libraries, but for now we'll just have
+    //  a couple pre-done passes.
+    void optimize(MLIRRuntime* runtime);
+
     uintptr_t jitToLLVM(MLIRRuntime* runtime);
   private:
     mlir::OwningOpRef<mlir::ModuleOp> module_;
     std::string kernelName_;
+
+    std::vector<CompileTimeStoreDescriptor> inputs_;
+    std::vector<CompileTimeStoreDescriptor> outputs_;
+    std::vector<CompileTimeStoreDescriptor> reducs_;
 };
+// Have to include this typdef to get around some Cython parsing
+// of pointer-typed template parameters.
+typedef MLIRModule* MLIRModulePtr;
 
 // TODO (rohany): Comment...
 class CompileTimeStoreDescriptor {
 public:
   CompileTimeStoreDescriptor();
-  CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ);
+  CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ, int64_t id);
   int32_t ndim;
   LegateTypeCode typ;
+  int64_t id;
 };
 
 // TODO (rohany): Comment...
@@ -112,7 +152,9 @@ class MLIRTaskBodyGenerator {
      const std::string& kernelName,
      const std::vector<CompileTimeStoreDescriptor>& inputs,
      const std::vector<CompileTimeStoreDescriptor>& outputs,
-     const std::vector<CompileTimeStoreDescriptor>& reducs
+     const std::vector<CompileTimeStoreDescriptor>& reducs,
+     char* buffer,
+     int32_t buflen
    ) = 0;
    virtual ~MLIRTaskBodyGenerator();
 };
@@ -129,7 +171,20 @@ public:
   static void body(legate::TaskContext& context);
 };
 
-
+// class TemporaryStorePromotionPass
+//   : public mlir::PassWrapper<TemporaryStorePromotionPass, mlir::OperationPass<mlir::func::FuncOp>> {
+//
+//  public:
+//   TemporaryStorePromotionPass(const std::vector<int64_t>& temporaryStoreIDs,
+//                               const std::map<int64_t, int64_t>& shapeResolutionMapping,
+//                               const std::map<int64_t, int32_t>& storeIDToIndexMapping);
+//   // TODO (rohany): Add in dependent dialect registration?
+//   void runOnOperation() final;
+//  private:
+//   const std::vector<int64_t>& temporaryStoreIDs_;
+//   const std::map<int64_t, int64_t>& shapeResolutionMapping_;
+//   const std::map<int64_t, int32_t>& storeIDToIndexMapping_;
+// };
 // Utility functions for developing MLIR task bodies.
 // TODO (rohany): In the future, maybe these go to a different file.
 

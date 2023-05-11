@@ -528,6 +528,17 @@ class Storage:
         # True means this storage is transferred
         self._transferred = False
 
+        self._num_external_references = 0
+
+    def increase_external_reference_count(self):
+        self._num_external_references += 1
+
+    def decrease_external_reference_count(self):
+        self._num_external_references -= 1
+
+    def has_external_references(self) -> bool:
+        return self._num_external_references != 0
+
     def __str__(self) -> str:
         return (
             f"{self._kind.__name__}(uninitialized)"
@@ -930,7 +941,7 @@ class Store:
         self._storage.move_data(other._storage)
 
     def to_comp_time_store_desc(self) -> PyCompileTimeStoreDescriptor:
-        return PyCompileTimeStoreDescriptor(self.ndim, self.type.code)
+        return PyCompileTimeStoreDescriptor(self.ndim, self.type.code, self._unique_id)
 
     @property
     def shape(self) -> Shape:
@@ -1746,13 +1757,16 @@ class Store:
         return self.partition(partition)
 
     def increase_external_reference_count(self):
-        self._num_external_references += 1
+        self._storage.increase_external_reference_count()
 
     def decrease_external_reference_count(self):
-        self._num_external_references -= 1
+        self._storage.decrease_external_reference_count()
 
     def has_external_references(self) -> bool:
-        return self._num_external_references == 0
+        return self._storage.has_external_references()
+
+    def __hash__(self):
+        return hash(self._unique_id)
 
 
 # ExternalStoreReference is a wrapper around a Store that

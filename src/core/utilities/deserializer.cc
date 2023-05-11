@@ -25,6 +25,8 @@
 
 namespace legate {
 
+SimpleDeserializer::SimpleDeserializer(const int8_t* args, size_t arglen) : BaseDeserializer(args, arglen) {}
+
 TaskDeserializer::TaskDeserializer(const Legion::Task* task,
                                    const std::vector<Legion::PhysicalRegion>& regions)
   : BaseDeserializer(task->args, task->arglen),

@@ -206,6 +206,7 @@ list(APPEND legate_core_SOURCES
   src/core/mapping/store.cc
   src/core/runtime/context.cc
   src/core/runtime/mlir.cc
+  src/core/runtime/mlir_passes.cc
   src/core/runtime/projection.cc
   src/core/runtime/runtime.cc
   src/core/runtime/shard.cc
@@ -220,6 +221,9 @@ list(APPEND legate_core_SOURCES
   src/core/utilities/machine.cc
   src/core/utilities/linearize.cc
 )
+
+# TODO (rohany): We need to either do this, or build LLVM with -DLLVM_ENABLE_RTTI=ON.
+set_source_files_properties(src/core/runtime/mlir_passes.cc PROPERTIES COMPILE_OPTIONS -fno-rtti)
 
 if(Legion_NETWORKS)
   list(APPEND legate_core_SOURCES
@@ -317,8 +321,6 @@ target_link_libraries(legate_core
    MLIRTransforms
    MLIRExecutionEngine
 )
-# TODO (rohany): See if we need -fno-rtti.
-
 
 target_include_directories(legate_core
   PUBLIC
@@ -369,6 +371,7 @@ if (legate_core_BUILD_DOCS)
       src/core/runtime/context.h
       src/core/runtime/mlir.h
       src/core/runtime/mlir_decls.h
+      src/core/runtime/mlir_passes.h
       # mapping
       src/core/mapping/mapping.h
       src/core/mapping/operation.h
@@ -455,6 +458,7 @@ install(
         src/core/runtime/context.inl
         src/core/runtime/mlir.h
         src/core/runtime/mlir_decls.h
+        src/core/runtime/mlir_passes.h
         src/core/runtime/resource.h
         src/core/runtime/runtime.h
         src/core/runtime/runtime.inl

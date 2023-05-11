@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import itertools
 import math
 import struct
 import sys
@@ -56,7 +57,7 @@ from . import (
 )
 from ._legion.env import LEGATE_MAX_FIELDS
 from ._legion.util import Dispatchable
-from ._lib.context import CppRuntime, PyMLIRTask  # type: ignore[import]
+from ._lib.context import CppRuntime, PyMLIRModule, PyMLIRTask  # type: ignore[import]
 from .allocation import Attachable
 from .communicator import CPUCommunicator, NCCLCommunicator
 from .corelib import core_library
@@ -1386,6 +1387,8 @@ class Runtime:
     def _schedule(self, ops: List[Operation]) -> None:
         from .solver import Partitioner
         from .operation import AutoTask
+        from .launcher import ScalarArg
+        from ._legion.util import BufferBuilder
 
         # TODO: For now we run the partitioner for each operation separately.
         #       We will eventually want to compute a trace-wide partitioning
@@ -1400,68 +1403,348 @@ class Runtime:
             with op.target_machine:
                 strategies.append(partitioner.partition_stores())
 
-        # Try to replace tasks by JIT-ed variants, and remap the partitioning
-        # strategy of the tasks over to the newly created task.
-        for i in range(len(ops)):
-            op, strategy = ops[i], strategies[i]
-            if not settings.kernel_fusion():
-                continue
-            if not isinstance(op, AutoTask):
-                continue
+        # TODO (rohany): I think it's time to try and write some kind of fusion
+        #  here. I think the goal for now is to first get the whole pipeline
+        #  working on the MLIR/LLVM side, so I think the prudent way forward
+        #  is to be lazy right now on figuring out what to fuse, and either
+        #  fuse everything in the window if all repeated stores have the exact
+        #  same partitions, or issue every task in the buffer independently.
 
+        # TODO (rohany): I also want to do this only if there are MLIR variants
+        #  for each task in the window.
+
+        should_try_fuse = True
+        for op in ops:
+            if not isinstance(op, AutoTask):
+                should_try_fuse = False
+                break
             tid = op._task_id
             info = op.context._cpp_context.find_task(tid)
             assert(info.valid)
             if not info.has_mlir_variant():
+                should_try_fuse = False
                 continue
 
-            gen = info.get_mlir_body_generator()
-            inputs = [s.to_comp_time_store_desc() for s in op.inputs]
-            outputs = [s.to_comp_time_store_desc() for s in op.outputs]
-            reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
-            desc = GeneratedTaskDescriptor(op.context.get_task_id(tid), inputs, outputs, reducs)
-            if desc in self._generated_kernel_cache:
-                local_task_id, funcptr = self._generated_kernel_cache[desc]
-            else:
-                # For now, assume that there isn't any additional information
-                # that we need to provide tasks with generate their task bodies
-                # other than a list of all the stores they access. We can also
-                # assume that the tasks generators don't get to use any information
-                # about the stores other than their data types and number of dimensions.
-                #
-                # TODO (rohany): I actually take that back, it looks like we have to pass
-                #  some extra information to task body generation even for getting binary
-                #  operations to work, since a single binary op definition is used for
-                #  every operation. I'm not sure what the API for this should be. Ideally
-                #  the Python users should be able to pass a blob of bytes through to the
-                #  generator function, which is able to interpret that as whatever is necessary.
-                module = gen.generate_body(inputs, outputs, reducs)
-                module.lowerToLLVMDialect()
-                funcptr = module.jitToLLVM()
-                local_task_id = op.context.get_fresh_local_task_id()
+        if should_try_fuse and settings.kernel_fusion():
+            store_parts: dict[Store, PartitionBase] = {}
+            all_eq = True
+            def check_store_part(store, part):
+                nonlocal all_eq
+                if store not in store_parts:
+                    store_parts[store] = part
+                else:
+                    all_eq = all_eq and store_parts[store] == part
+
+            for i in range(len(ops)):
+                op, strategy = ops[i], strategies[i]
+                for input, sym in zip(op.inputs, op._input_parts):
+                    check_store_part(input, strategy.get_partition(sym))
+                for output, sym in zip(op.outputs, op._output_parts):
+                    check_store_part(output, strategy.get_partition(sym))
+
+            if all_eq:
+                # Now we have to actually generate a fused task body.
+                # Things that need to be accomplished:
+                # 1) Demotion of temporary stores into local allocations.
+                #    The rules for this need to be thought through more clearly,
+                #    because we have to take into account the partitioning constraint
+                #    being applied to the temporary stores to really make them
+                #    temporary, as well as to figure out what the sizes of those
+                #    local allocations should be, in case they don't get removed.
+                #    TODO (rohany): I think that for now, we can just assume that
+                #     the only constraints being used are tiling and alignment
+                #     constraints, so we can just use the sizes of one of the
+                #     other stores for the size of the local allocations.
+                # 2) The building of a super-task that contains all of the task bodies
+                #    of the original tasks, but has also eliminated redundant stores
+                #    from the inputs of each task, so that the super task takes in
+                #    a unique set of inputs.
+                # 3) The application of MLIR optimization passes on the generated
+                #    super-task that actually optimize the resulting code.
+
+                # First construct MLIR modules for each of the task bodies.
+                modules = []
+                for op in ops:
+                    tid = op._task_id
+                    info = op.context._cpp_context.find_task(tid)
+                    gen = info.get_mlir_body_generator()
+                    inputs = [s.to_comp_time_store_desc() for s in op.inputs]
+                    outputs = [s.to_comp_time_store_desc() for s in op.outputs]
+                    reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
+
+                    # TODO (rohany): Pack the arguments into a buffer for the tasks.
+                    builder = BufferBuilder()
+                    for arg, dtype in op._scalar_args:
+                        scalar = ScalarArg(self._core_context.type_system, arg, dtype)
+                        scalar.pack(builder)
+                    buffer = bytes(builder.get_string())
+                    bufSize = builder.get_size()
+                    modules.append(gen.generate_body(inputs, outputs, reducs, buffer, bufSize))
+
+                # We have to come up with a calling convention here for the fused task.
+                # The simplest thing to do is group all inputs, then outputs, then reductions.
+                # So I'll deduplicate each of the sets of stores, and use that to remap
+                # all of the inputs from each task to the new arguments of the super-task.
+                new_inputs, new_outputs, new_reducs = [], [], []
+                dedup_inputs, dedup_outputs, dedup_reducs = set(), set(), set()
+                first_op_inputs, final_op_outputs = set(), set()
+                for i in range(len(ops)):
+                    op = ops[i]
+                    def dedup_add(l, s, val):
+                        if val not in s:
+                            s.add(val)
+                            l.append(val)
+                    for input in op.inputs:
+                        dedup_add(new_inputs, dedup_inputs, input)
+                        if i == 0:
+                            first_op_inputs.add(input)
+                    for output in op.outputs:
+                        dedup_add(new_outputs, dedup_outputs, output)
+                        if i == (len(ops) - 1):
+                            final_op_outputs.add(output)
+                    for reduc, _ in op.reductions:
+                        dedup_add(new_reducs, dedup_reducs, reduc)
+
+                # We'll order the stores in the calling convention like [inputs, outputs, reductions],
+                # so we can construct a mapping from a particular store to an index in this concatenation.
+                store_id_to_index_mapping = {}
+                index = 0
+                # TODO (rohany): Haven't yet handled when the same store appears in
+                #  both the inputs and outputs here.
+                for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                    store_id_to_index_mapping[store._unique_id] = index
+                    index += 1
+
+                new_input_descs = [s.to_comp_time_store_desc() for s in new_inputs]
+                new_output_descs = [s.to_comp_time_store_desc() for s in new_outputs]
+                new_reduc_descs = [s.to_comp_time_store_desc() for s in new_reducs]
+                # Now construct a new MLIR module that fuses all of the tasks together
+                # into a single body, and uses the constructed mappings to perform
+                # the remappings of each argument to the new arguments.
+                fused = PyMLIRModule.construct_fused_module(
+                    modules,
+                    new_input_descs,
+                    new_output_descs,
+                    new_reduc_descs,
+                    store_id_to_index_mapping
+                )
+                # TODO (rohany): I want to perform unification in the generated task
+                #  arguments when a store in inputs and outputs gets promoted to read-write.
+                # fused.dump()
+
+                # Here can be the application of Legate-specific transformations, such
+                # as the removal of temporary stores, and burning of store transformations.
+
+                ######### Temporary Elimination
+
+                # 1) Demote temporary stores to allocations local to task bodies.
+                # TODO (rohany): Brainstorming stuff here ....
+                #  * We can demote temporary stores that are not the input to
+                #    the first task in our fused buffer, and are not the output
+                #    or reduction of the final task in our buffer.
+                #  * The temporary store needs to also have a "locally computable"
+                #    set of dimensions (shape). The rules for this around unbound stores are
+                #    unclear for now, so we can punt that to later. The definition
+                #    of "locally computable" is that the shape of the local
+                #    allocation can be computed purely from the shapes of region arguments
+                #    to the task, and does not require any communication to compute.
+                #    It's likely the case (I haven't verified this yet), but temporaries
+                #    that require communication to compute the shapes of will not be
+                #    able to be fused anyway (unbound stores will make the rules here iffy).
+
+                # As a first pass at computing resolved shapes for temporary allocations,
+                # let's first make a structure of all stores using the same partitioning.
+                same_partitions = {}
+                def add_partition(store, part):
+                    nonlocal same_partitions
+                    if part not in same_partitions:
+                        same_partitions[part] = set()
+                    same_partitions[part].add(store)
+                for op, strategy in zip(ops, strategies):
+                    # TODO (rohany): Deal with reductions.
+                    for input, sym in zip(op.inputs, op._input_parts):
+                        add_partition(input, strategy.get_partition(sym))
+                    for output, sym in zip(op.outputs, op._output_parts):
+                        add_partition(output, strategy.get_partition(sym))
+
+                # Now find the temporary stores.
+                temporaries = []
+                temporary_store_ordinals = []
+                index = 0
+                durable_inputs, durable_outputs = [], []
+                for store in new_inputs:
+                    if not store.has_external_references() and store not in first_op_inputs:
+                        temporaries.append(store)
+                        temporary_store_ordinals.append(index)
+                    else:
+                        durable_inputs.append(store)
+                    index += 1
+                for store in new_outputs:
+                    if not store.has_external_references() and store not in final_op_outputs:
+                        temporaries.append(store)
+                        temporary_store_ordinals.append(index)
+                    else:
+                        durable_outputs.append(store)
+                    index += 1
+                # TODO (rohany): I don't actually think reduction stores can be temporary?
+                # for store in new_reducs:
+                #     if not store.has_external_references():
+                #         temporaries.append(store)
+                #         temporary_store_ordinals.append(index)
+                #     else:
+                #         durable_reducs.append(store)
+                #     index += 1
+                new_inputs, new_outputs = durable_inputs, durable_outputs
+
+                store_id_to_index_mapping = {}
+                index = 0
+                # TODO (rohany): Haven't yet handled when the same store appears in
+                #  both the inputs and outputs here.
+                for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                    store_id_to_index_mapping[store._unique_id] = index
+                    index += 1
+
+                # For each of the temporary stores, find a store that can be used to infer
+                # the shape of the local allocation. For now, this just means finding
+                # another store in the argument list that uses the same partition.
+                resolved_shape_ordinals = []
+                for temporary in temporaries:
+                    part = store_parts[temporary]
+                    other_stores = same_partitions[part] - {temporary}
+                    resolved = next(iter(other_stores))
+                    resolved_shape_ordinals.append(store_id_to_index_mapping[resolved._unique_id])
+
+                fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
+
+                ######### Done Temporary Elimination
+
+                ######### Standard pass application
+
+                fused.optimize()
+
+                ######### Done standard pass application
+
+                fused.dump()
+
+
+                # TODO (rohany): At this point, all of the analysis being done to the
+                #  task should be finished.
+
+                # TODO (rohany): Worry about caching this fused task later.
+                fused.lowerToLLVMDialect()
+                funcptr = fused.jitToLLVM()
+                # TODO (rohany): Worry about when these ops come from different libraries.
+                local_task_id = ops[0].context.get_fresh_local_task_id()
                 PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id))
-                self._generated_kernel_cache[desc] = (local_task_id, funcptr)
-            # Now construct a new AutoTask using this ID.
-            newTask = op.context.create_auto_task(local_task_id)
-            for input in op.inputs:
-                newTask.add_input(input)
-            for output in op.outputs:
-                newTask.add_output(output)
-            assert(len(op.reductions) == 0)
-            # TODO (rohany): Whoops, binop doesn't accept scalar args yet.
-            # assert(len(op._scalar_args) == 0)
-            newTask.add_scalar_arg(funcptr, ty.uint64)
-            ops[i] = newTask
+                newTask = ops[0].context.create_auto_task(local_task_id)
+                for input in new_inputs:
+                    newTask.add_input(input)
+                for output in new_outputs:
+                    newTask.add_output(output)
+                # TODO (rohany): Deal with reductions later.
+                newTask.add_scalar_arg(funcptr, ty.uint64)
+                # Now construct a partitioning strategy that fuses together
+                # all of the partitioning strategies for each point operation.
+                new_strat = strategies[0]
+                for strat in strategies[1:]:
+                    new_strat.merge(strat)
+                # After merging all of the strategies, remap the strategy
+                # to the new task's symbols.
+                part_sym_mapping = {}
+                def get_elem(idx: int, l1, l2, l3):
+                    if idx < len(l1):
+                        return l1[idx]
+                    idx -= len(l1)
+                    if idx < len(l2):
+                        return l2[idx]
+                    idx -= len(l2)
+                    return l3[idx]
+                # TODO (rohany): Need to replace the temp_set with just a set of
+                #  all the stores that are left.
+                temp_set = set(temporaries)
+                for op in ops:
+                    for store, sym in zip(op.inputs, op._input_parts):
+                        if store in temp_set:
+                            continue
+                        idx = store_id_to_index_mapping[store._unique_id]
+                        part_sym_mapping[sym] = get_elem(idx, newTask._input_parts, newTask._output_parts, newTask._reduction_parts)
+                    for store, sym in zip(op.outputs, op._output_parts):
+                        if store in temp_set:
+                            continue
+                        idx = store_id_to_index_mapping[store._unique_id]
+                        part_sym_mapping[sym] = get_elem(idx, newTask._input_parts, newTask._output_parts, newTask._reduction_parts)
+                    for (store, _), sym in zip(op.reductions, op._reduction_parts):
+                        if store in temp_set:
+                            continue
+                        idx = store_id_to_index_mapping[store._unique_id]
+                        part_sym_mapping[sym] = get_elem(idx, newTask._input_parts, newTask._output_parts, newTask._reduction_parts)
+                new_strat = new_strat.remap(part_sym_mapping)
 
-            # Now remap the partition symbols over to the task.
-            part_sym_mapping = {}
-            for src, dest in zip(op._input_parts, newTask._input_parts):
-                part_sym_mapping[src] = dest
-            for src, dest in zip(op._output_parts, newTask._output_parts):
-                part_sym_mapping[src] = dest
-            # TODO (rohany): Do the reduction parts here.
+                ops = [newTask]
+                strategies = [new_strat]
+        else:
+            # Try to replace tasks by JIT-ed variants, and remap the partitioning
+            # strategy of the tasks over to the newly created task.
+            for i in range(len(ops)):
+                op, strategy = ops[i], strategies[i]
+                if not settings.kernel_fusion():
+                    continue
+                if not isinstance(op, AutoTask):
+                    continue
 
-            strategies[i] = strategy.remap(part_sym_mapping)
+                tid = op._task_id
+                info = op.context._cpp_context.find_task(tid)
+                assert(info.valid)
+                if not info.has_mlir_variant():
+                    continue
+
+                gen = info.get_mlir_body_generator()
+                inputs = [s.to_comp_time_store_desc() for s in op.inputs]
+                outputs = [s.to_comp_time_store_desc() for s in op.outputs]
+                reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
+                desc = GeneratedTaskDescriptor(op.context.get_task_id(tid), inputs, outputs, reducs)
+                if desc in self._generated_kernel_cache:
+                    local_task_id, funcptr = self._generated_kernel_cache[desc]
+                else:
+                    # For now, assume that there isn't any additional information
+                    # that we need to provide tasks with generate their task bodies
+                    # other than a list of all the stores they access. We can also
+                    # assume that the tasks generators don't get to use any information
+                    # about the stores other than their data types and number of dimensions.
+                    #
+                    # TODO (rohany): I actually take that back, it looks like we have to pass
+                    #  some extra information to task body generation even for getting binary
+                    #  operations to work, since a single binary op definition is used for
+                    #  every operation. I'm not sure what the API for this should be. Ideally
+                    #  the Python users should be able to pass a blob of bytes through to the
+                    #  generator function, which is able to interpret that as whatever is necessary.
+                    module = gen.generate_body(inputs, outputs, reducs)
+                    module.lowerToLLVMDialect()
+                    funcptr = module.jitToLLVM()
+                    local_task_id = op.context.get_fresh_local_task_id()
+                    PyMLIRTask.register_variant("JITTED_SINGLE_TASK", op.context.get_task_id(local_task_id))
+                    self._generated_kernel_cache[desc] = (local_task_id, funcptr)
+                # Now construct a new AutoTask using this ID.
+                newTask = op.context.create_auto_task(local_task_id)
+                for input in op.inputs:
+                    newTask.add_input(input)
+                for output in op.outputs:
+                    newTask.add_output(output)
+                assert(len(op.reductions) == 0)
+
+                # TODO (rohany): Whoops, binop doesn't accept scalar args yet.
+                # assert(len(op._scalar_args) == 0)
+                newTask.add_scalar_arg(funcptr, ty.uint64)
+                ops[i] = newTask
+
+                # Now remap the partition symbols over to the task.
+                part_sym_mapping = {}
+                for src, dest in zip(op._input_parts, newTask._input_parts):
+                    part_sym_mapping[src] = dest
+                for src, dest in zip(op._output_parts, newTask._output_parts):
+                    part_sym_mapping[src] = dest
+                # TODO (rohany): Do the reduction parts here.
+                strategies[i] = strategy.remap(part_sym_mapping)
 
 
 

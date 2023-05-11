@@ -73,6 +73,7 @@ class EqClass(Generic[T]):
         self._classes[cls_id1] = new_cls
         self._classes[cls_id2] = new_cls
 
+    # TODO (rohany): Comment...
     def remap(self, mapping: dict[T, T]) -> EqClass[T]:
         def map(val: T) -> T:
             if val in mapping:
@@ -83,12 +84,13 @@ class EqClass(Generic[T]):
             new_set: OrderedSet[T] = OrderedSet()
             for val in s:
                 new_set.add(map(val))
-            new_classes[k] = s
+            new_classes[map(k)] = s
         result = EqClass()
-        result._class_ids = self._class_ids
+        result._class_ids = {map(k): v for k, v in self._class_ids.items()}
         result._next_class_id = self._next_class_id
         result._classes = new_classes
         return result
+
 
     def record(self, var1: T, var2: T) -> None:
         """
@@ -215,8 +217,24 @@ class Strategy:
         new_fspaces = {map(sym): fspace for sym, fspace in self._fspaces.items()}
         new_key_parts = {map(sym) for sym in self._key_parts}
         new_eq_classes = self._eq_classes.remap(mapping)
-        new_launch_domain = self._launch_domain.hi if self._launch_domain is not None else None
+        new_launch_domain = (Shape(self._launch_domain.hi) + 1) if self._launch_domain is not None else None
         return Strategy(new_launch_domain, new_strategy, new_fspaces, new_key_parts, new_eq_classes)
+
+    # Merge this strategy with another partitioning strategy, destructively
+    # updating the current strategy.
+    def merge(self, other: Strategy):
+        assert(self._launch_domain == other._launch_domain)
+        for sym, part in other._strategy.items():
+            # TODO (rohany): Are repeats allowed? What happens here?
+            assert(sym not in self._strategy)
+            self._strategy[sym] = part
+        for sym, fspace in other._fspaces.items():
+            assert(sym not in self._fspaces)
+            self._fspaces[sym] = fspace
+        for sym in other._key_parts:
+            assert(sym not in self._key_parts)
+            self._key_parts.add(sym)
+        self._eq_classes.union(other._eq_classes)
 
     def __str__(self) -> str:
         st = "[Strategy]"
