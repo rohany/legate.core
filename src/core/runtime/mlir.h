@@ -36,6 +36,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 
+#include "core/data/transform.h"
 #include "core/runtime/context.h"
 #include "core/runtime/mlir_passes.h"
 #include "core/utilities/typedefs.h"
@@ -137,10 +138,11 @@ typedef MLIRModule* MLIRModulePtr;
 class CompileTimeStoreDescriptor {
 public:
   CompileTimeStoreDescriptor();
-  CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ, int64_t id);
+  CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ, int64_t id, std::shared_ptr<TransformStack>);
   int32_t ndim;
   LegateTypeCode typ;
   int64_t id;
+  std::shared_ptr<TransformStack> transform;
 };
 
 // TODO (rohany): Comment...
@@ -189,6 +191,6 @@ public:
 // TODO (rohany): In the future, maybe these go to a different file.
 
 mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, LegateTypeCode typ);
-mlir::MemRefType buildMemRefTypeOfDim(mlir::MLIRContext* ctx, int32_t ndim, LegateTypeCode typ);
+mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreDescriptor& desc);
 
 }

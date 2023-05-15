@@ -14,6 +14,7 @@
  *
  */
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
@@ -21,6 +22,7 @@
 #include "core/runtime/mlir_passes.h"
 
 #include <set>
+#include <iostream>
 
 namespace legate {
 
@@ -108,7 +110,6 @@ void TemporaryStorePromotionPass::runOnOperation() {
   auto newFuncType = builder.getFunctionType(newArgTypes, std::nullopt);
   op.setFunctionType(newFuncType);
 
-
   // TODO (rohany): We have to see what data structures are needed here,
   //  but this pass needs to do:
   //  1) Remove the arguments corresponding to temporary stores.
@@ -119,6 +120,53 @@ void TemporaryStorePromotionPass::runOnOperation() {
   // TODO (rohany): I think that I want to change the arguments here so that we
   //  are just dealing with argument ordinals, rather than store IDs, as the MLIR
   //  pass at this point has no concept of store IDs.
+}
+
+MemrefDimensionAccessNormalizingPass::MemrefDimensionAccessNormalizingPass() {}
+
+void MemrefDimensionAccessNormalizingPass::runOnOperation() {
+  auto& ctx = this->getContext();
+  mlir::func::FuncOp op = this->getOperation();
+  auto& entryBlock = op.getBlocks().front();
+  auto numArgs = entryBlock.getNumArguments();
+  auto loc = mlir::NameLoc::get(mlir::StringAttr::get(&ctx, "dimensionAccessNormalization"));
+  mlir::OpBuilder builder(&ctx);
+
+  // For each argument, we'll add a new argument that represents the dynamic
+  // size of the memref before any transformations are applied, which will
+  // be supplied by the task wrapper. Then, we'll re-write any operations that
+  // try to access the dimensions of the argument memref, as they may get
+  // re-written to be invalid once the NormalizeMemRefs pass completes.
+  llvm::SmallVector<mlir::Type, 8> origArgTypes;
+  llvm::SmallVector<mlir::Type, 8> newArgTypes;
+  for (size_t i = 0; i < numArgs; i++) {
+    // First, add the new argument.
+    auto arg = entryBlock.getArgument(i);
+    auto argType = mlir::cast<mlir::MemRefType>(arg.getType());
+    auto newArgType = mlir::MemRefType::get({argType.getRank()}, mlir::IndexType::get(&ctx));
+    auto newArg = entryBlock.addArgument(newArgType, loc);
+    origArgTypes.push_back(argType);
+    newArgTypes.push_back(newArgType);
+
+    // Now replace all uses of the initial argument dims with accesses into
+    // this separate memref of dims.
+    std::vector<mlir::Operation*> toErase;
+    for (mlir::Operation* user : arg.getUsers()) {
+      if (!mlir::isa<mlir::memref::DimOp>(user)) { continue; }
+      mlir::memref::DimOp dimOp = mlir::cast<mlir::memref::DimOp>(user);
+      builder.setInsertionPoint(user);
+      auto newDim = builder.create<mlir::AffineLoadOp>(loc, newArg, dimOp.getIndex());
+      user->replaceAllUsesWith(newDim);
+      toErase.push_back(user);
+    }
+    for (auto op : toErase) { op->erase(); }
+  }
+
+  llvm::SmallVector<mlir::Type, 8> argTypes;
+  for (auto it : origArgTypes) { argTypes.push_back(it); }
+  for (auto it : newArgTypes) { argTypes.push_back(it); }
+  auto newFuncType = builder.getFunctionType(argTypes, std::nullopt);
+  op.setFunctionType(newFuncType);
 }
 
 }

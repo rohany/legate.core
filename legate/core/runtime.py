@@ -1472,6 +1472,8 @@ class Runtime:
                     outputs = [s.to_comp_time_store_desc() for s in op.outputs]
                     reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
 
+                    print(op.inputs)
+
                     # TODO (rohany): Pack the arguments into a buffer for the tasks.
                     builder = BufferBuilder()
                     for arg, dtype in op._scalar_args:
@@ -1552,6 +1554,14 @@ class Runtime:
                 #    that require communication to compute the shapes of will not be
                 #    able to be fused anyway (unbound stores will make the rules here iffy).
 
+
+                # TODO (rohany):
+                #  Rules for temporary elimination that will come up later when we do
+                #  fusion of partial task buffers:
+                #  A store is temporary if it has no external references and is not
+                #  read by any operations remaining in the unfused portion of the
+                #  buffer at the time of fusion.
+
                 # As a first pass at computing resolved shapes for temporary allocations,
                 # let's first make a structure of all stores using the same partitioning.
                 same_partitions = {}
@@ -1572,14 +1582,29 @@ class Runtime:
                 temporary_store_ordinals = []
                 index = 0
                 durable_inputs, durable_outputs = [], []
+
+                # TODO (rohany): A generalization of the "not in first_op_inputs" is that
+                #  an input-only store can only be marked as temporary if it is defined (written to)
+                #  by an operation preceding it in the task pipeline.
+                # TODO (rohany): This is just a hack, not sure yet if I need a sliding window
+                #  kind of data structure.
+                defined_storages = set()
+                for op in ops:
+                    for store in op.outputs:
+                        defined_storages.add(store.storage)
+
+                # TODO (rohany): Scalar stores are getting marked as temporary??
                 for store in new_inputs:
-                    if not store.has_external_references() and store not in first_op_inputs:
+                    if not store.has_external_references() and store.storage in defined_storages:
                         temporaries.append(store)
                         temporary_store_ordinals.append(index)
                     else:
                         durable_inputs.append(store)
                     index += 1
                 for store in new_outputs:
+                    # TODO (rohany): This check of final_op_outputs should really be (as
+                    #  discussed above somewhere) that there aren't any operations in
+                    #  un-executed parts of the buffer that use this storage as an input.
                     if not store.has_external_references() and store not in final_op_outputs:
                         temporaries.append(store)
                         temporary_store_ordinals.append(index)
@@ -1615,6 +1640,8 @@ class Runtime:
                     resolved_shape_ordinals.append(store_id_to_index_mapping[resolved._unique_id])
 
                 fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
+
+                # fused.dump()
 
                 ######### Done Temporary Elimination
 

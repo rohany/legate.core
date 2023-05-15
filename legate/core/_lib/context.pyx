@@ -18,7 +18,7 @@ from typing import List
 
 from libcpp cimport bool
 from libcpp.map cimport map
-from libcpp.memory cimport unique_ptr, shared_ptr
+from libcpp.memory cimport unique_ptr, shared_ptr, make_shared, make_unique
 from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
@@ -33,6 +33,50 @@ cdef extern from "core/legate_c.h" nogil:
 
 # TODO (rohany): It doesn't seem like we can get around doing a bunch
 #  of random copies etc at the boundary here.
+
+cdef extern from "core/data/transform.h" namespace "legate" nogil:
+    cdef cppclass StoreTransform:
+        pass
+
+    cdef cppclass TransformStack:
+        TransformStack()
+        TransformStack(unique_ptr[StoreTransform]&& transform,
+                       shared_ptr[TransformStack]&& parent)
+        unique_ptr[StoreTransform] pop()
+        void dump()
+
+    cdef cppclass Promote:
+        Promote(int32_t, int64_t)
+        # TODO (rohany): Do I need to expose the underlying dim_size or dim_?
+
+    cdef cppclass Shift:
+        Shift(int32_t dim, int64_t offset)
+        # TODO (rohany): Do I need to expose the underlying dim_ and offset_?
+
+
+cdef class PyTransformStack:
+    cdef shared_ptr[TransformStack] _stack
+    def __init__(self):
+        self._stack = make_shared[TransformStack]()
+
+    def add_promote(self, object tx):
+        cdef int extra_dim = tx._extra_dim
+        cdef int dim_size = tx._dim_size
+        self._stack = make_shared[TransformStack](
+          make_unique[Promote](extra_dim, dim_size),
+          move(self._stack)
+        )
+
+    def add_shift(self, object tx):
+        cdef int dim = tx._dim
+        cdef int offset = tx._offset
+        self._stack = make_shared[TransformStack](
+          make_unique[Shift](dim, offset),
+          move(self._stack)
+        )
+
+    def dump(self):
+        self._stack.get().dump()
 
 
 # TODO (rohany): I'm not sure how to import the definition from the other file...
@@ -71,7 +115,7 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
 
     cdef cppclass CompileTimeStoreDescriptor:
         CompileTimeStoreDescriptor()
-        CompileTimeStoreDescriptor(int32_t, legate_core_type_code_t, int64_t)
+        CompileTimeStoreDescriptor(int32_t, legate_core_type_code_t, int64_t, shared_ptr[TransformStack])
         int32_t ndim
         legate_core_type_code_t typ
         int64_t id
@@ -110,8 +154,8 @@ cdef extern from "core/runtime/runtime.h" namespace "legate" nogil:
 cdef class PyCompileTimeStoreDescriptor:
     cdef CompileTimeStoreDescriptor desc
 
-    def __init__(self, int ndim, legate_core_type_code_t typ, int id):
-        self.desc = CompileTimeStoreDescriptor(ndim, typ, id)
+    def __init__(self, int ndim, legate_core_type_code_t typ, int id, PyTransformStack stack):
+        self.desc = CompileTimeStoreDescriptor(ndim, typ, id, stack._stack)
 
     def __str__(self):
         return f"CompileTimeStoreDescriptor({self.desc.ndim}, {self.desc.typ}, {self.desc.id})"

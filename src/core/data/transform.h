@@ -47,6 +47,8 @@ struct TransformStack : public Transform {
  public:
   std::unique_ptr<StoreTransform> pop();
   bool identity() const { return nullptr == transform_; }
+  // TODO (rohany): Comment this...
+  void iter_transforms(const std::function<void (StoreTransform*)>& f) const;
 
  public:
   void dump() const;
@@ -84,6 +86,8 @@ class Promote : public StoreTransform {
 
  public:
   virtual int32_t target_ndim(int32_t source_ndim) const override;
+
+  int32_t get_extra_dim() const { return this->extra_dim_; }
 
  private:
   int32_t extra_dim_;

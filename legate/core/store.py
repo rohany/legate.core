@@ -941,7 +941,8 @@ class Store:
         self._storage.move_data(other._storage)
 
     def to_comp_time_store_desc(self) -> PyCompileTimeStoreDescriptor:
-        return PyCompileTimeStoreDescriptor(self.ndim, self.type.code, self._unique_id)
+        return PyCompileTimeStoreDescriptor(
+            self.ndim, self.type.code, self._unique_id, self._transform.to_cpp_transform_stack())
 
     @property
     def shape(self) -> Shape:

@@ -45,4 +45,11 @@ class TemporaryStorePromotionPass
   const std::vector<int32_t>& resolutionOrdinalMapping_;
 };
 
+class MemrefDimensionAccessNormalizingPass :
+  public mlir::PassWrapper<MemrefDimensionAccessNormalizingPass, mlir::OperationPass<mlir::func::FuncOp>> {
+  public:
+   MemrefDimensionAccessNormalizingPass();
+   void runOnOperation() final;
+};
+
 }

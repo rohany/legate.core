@@ -24,6 +24,8 @@ from .projection import ProjExpr
 from .runtime import runtime
 from .shape import Shape
 
+from ._lib.context import PyTransformStack
+
 if TYPE_CHECKING:
     from . import BufferBuilder
     from .partition import PartitionBase
@@ -593,6 +595,9 @@ class TransformStackBase(TransformProto, Protocol):
     def invert_partition(self, partition: PartitionBase) -> PartitionBase:
         ...
 
+    def to_cpp_transform_stack(self) -> PyTransformStack:
+        ...
+
 
 class TransformStack(TransformStackBase):
     def __init__(
@@ -611,6 +616,22 @@ class TransformStack(TransformStackBase):
         return (
             self._transform.adds_fake_dims() or self._parent.adds_fake_dims()
         )
+
+    def to_cpp_transform_stack(self) -> PyTransformStack:
+        result = PyTransformStack()
+        stack = self
+        txs = []
+        while not stack.bottom:
+            txs.append(stack._transform)
+            stack = stack._parent
+        for tx in reversed(txs):
+            if isinstance(tx, Promote):
+                result.add_promote(tx)
+            elif isinstance(tx, Shift):
+                result.add_shift(tx)
+            else:
+                assert(False)
+        return result
 
     @property
     def convertible(self) -> bool:
@@ -732,6 +753,9 @@ class IdentityTransform(TransformStackBase):
 
     def serialize(self, buf: BufferBuilder) -> None:
         buf.pack_32bit_int(-1)
+
+    def to_cpp_transform_stack(self) -> PyTransformStack:
+        return PyTransformStack()
 
 
 identity = IdentityTransform()

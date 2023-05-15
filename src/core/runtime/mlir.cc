@@ -36,9 +36,11 @@
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Affine/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/Pass/PassManager.h"
@@ -258,6 +260,7 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
   mlir::populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
   mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
   mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+  mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
   // mlir::populateOpenMPToLLVMConversionPatterns(typeConverter, patterns);
   mlir::FrozenRewritePatternSet frozenPatterns(std::move(patterns));
   if (mlir::failed(mlir::applyFullConversion(this->module_.get(), convTarget, frozenPatterns))) {
@@ -336,9 +339,9 @@ std::unique_ptr<MLIRModule> MLIRModule::fuseModules(
   auto loc = mlir::NameLoc::get(mlir::StringAttr::get(ctx, "fused_task"));
 
   llvm::SmallVector<mlir::Type, 8> funcTypeArgs;
-  for (auto store : inputs) { funcTypeArgs.push_back(buildMemRefTypeOfDim(ctx, store.ndim, store.typ)); }
-  for (auto store : outputs) { funcTypeArgs.push_back(buildMemRefTypeOfDim(ctx, store.ndim, store.typ)); }
-  for (auto store : reducs) { funcTypeArgs.push_back(buildMemRefTypeOfDim(ctx, store.ndim, store.typ)); }
+  for (auto store : inputs) { funcTypeArgs.push_back(buildMemRefType(ctx, store)); }
+  for (auto store : outputs) { funcTypeArgs.push_back(buildMemRefType(ctx, store)); }
+  for (auto store : reducs) { funcTypeArgs.push_back(buildMemRefType(ctx, store)); }
   auto funcType = builder.getFunctionType(funcTypeArgs, std::nullopt);
   // TODO (rohany): I should make this a static attribute or something, because it's used everywhere.
   mlir::NamedAttribute namedAttr(mlir::StringAttr::get(ctx, "llvm.emit_c_interface"), mlir::UnitAttr::get(ctx));
@@ -438,11 +441,21 @@ void MLIRModule::promoteTemporaryStores(
 void MLIRModule::optimize(MLIRRuntime* runtime) {
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
-  mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
-  funcsPM.addPass(mlir::createCSEPass());
-  funcsPM.addPass(mlir::createLoopFusionPass(0, 0, true, mlir::FusionMode::Greedy));
-  funcsPM.addPass(mlir::createAffineScalarReplacementPass());
-  funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+  {
+    mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
+    funcsPM.addPass(mlir::createCSEPass());
+    funcsPM.addPass(mlir::createLoopFusionPass(0, 0, true, mlir::FusionMode::Greedy));
+    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+  }
+
+  // TODO (rohany): Eventually move this out of the "optimize" function.
+  pm.addPass(mlir::memref::createNormalizeMemRefsPass());
+  {
+    mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
+    funcsPM.addPass(std::make_unique<MemrefDimensionAccessNormalizingPass>());
+    funcsPM.addPass(mlir::createAffineLoopInvariantCodeMotionPass());
+  }
 
   // pm.enableIRPrinting();
 
@@ -453,9 +466,14 @@ void MLIRModule::optimize(MLIRRuntime* runtime) {
 
 MLIRTaskBodyGenerator::~MLIRTaskBodyGenerator() {}
 
-CompileTimeStoreDescriptor::CompileTimeStoreDescriptor() : ndim(0), typ(LegateTypeCode::MAX_TYPE_NUMBER), id(0) {}
+CompileTimeStoreDescriptor::CompileTimeStoreDescriptor() : ndim(0), typ(LegateTypeCode::MAX_TYPE_NUMBER), id(0), transform(nullptr) {}
 
-CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ, int64_t id) : ndim(ndim), typ(typ), id(id) {}
+CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(
+  int32_t ndim,
+  LegateTypeCode typ,
+  int64_t id,
+  std::shared_ptr<TransformStack> transform
+) : ndim(ndim), typ(typ), id(id), transform(transform) {}
 
 /* static */
 void MLIRTask::register_variant(std::string& name, int task_id) {
@@ -504,6 +522,24 @@ struct AccessorToMemrefDescAlloc {
   }
 };
 
+struct FutureToMemrefDescAlloc {
+  template<LegateTypeCode CODE>
+  void* operator()(const Store& store, bool read) {
+    using T = legate_type_of<CODE>;
+    StridedMemRefType<T, 1> memref;
+    if (read) {
+      auto acc = store.read_accessor<T, 1>();
+      memref = accessorToMemRef<decltype(acc), T, 1>(acc, store.shape<1>());
+    } else {
+      auto acc = store.write_accessor<T, 1>();
+      memref = accessorToMemRef<decltype(acc), T, 1>(acc, store.shape<1>());
+    }
+    auto argPtr = static_cast<StridedMemRefType<T, 1>*>(malloc(sizeof(decltype(memref))));
+    *argPtr = memref;
+    return argPtr;
+  }
+};
+
 /* static */
 void MLIRTask::body(TaskContext& context) {
   auto& inputs = context.inputs();
@@ -523,11 +559,39 @@ void MLIRTask::body(TaskContext& context) {
   //  a bunch of times on each task invocation...
 
   llvm::SmallVector<void*, 8> argData;
+  llvm::SmallVector<void*, 8> dimDatas;
+  llvm::SmallVector<void*, 8> dimArgData;
   // Pack all of the inputs and outputs into Memref types.
-  auto addStoreToArgs = [&](const Store& store, bool read) {
-    // TODO (rohany): Not handling transforms right now.
-    assert(!store.transformed());
-    auto argPtr = double_dispatch(store.dim(), store.code(), AccessorToMemrefDescAlloc{}, store, read);
+  auto addStoreToArgs = [&](Store& store, bool read) {
+    // TODO (rohany): Comment...
+    {
+      StridedMemRefType<int64_t, 1> memref{};
+
+      auto data = (int64_t*)malloc(sizeof(int64_t) * store.dim());
+      memref.basePtr = data;
+      memref.data = data;
+      memref.offset = 0;
+      memref.sizes[0] = store.dim();
+      memref.strides[0] = 1;
+      auto dom = store.domain();
+      for (int i = 0; i < store.dim(); i++) {
+        data[i] = dom.hi()[i] - dom.lo()[i] + 1;
+      }
+
+      auto argPtr = (StridedMemRefType<int64_t, 1>*)malloc(sizeof(StridedMemRefType<int64_t, 1>));
+      *argPtr = memref;
+      dimDatas.push_back(data);
+      dimArgData.push_back(argPtr);
+    }
+    while (store.transformed()) {
+      store.remove_transform();
+    }
+    void* argPtr = nullptr;
+    if (store.is_future()) {
+      argPtr = type_dispatch(store.code(), FutureToMemrefDescAlloc{}, store, read);
+    } else {
+      argPtr = double_dispatch(store.dim(), store.code(), AccessorToMemrefDescAlloc{}, store, read);
+    }
     argData.push_back(argPtr);
   };
 
@@ -537,6 +601,9 @@ void MLIRTask::body(TaskContext& context) {
   for (auto& store : outputs) {
     addStoreToArgs(store, false);
   }
+  for (auto arg : dimArgData) {
+    argData.push_back(arg);
+  }
 
   llvm::SmallVector<void*, 8> args;
   for (size_t i = 0; i < argData.size(); i++) {
@@ -544,6 +611,10 @@ void MLIRTask::body(TaskContext& context) {
   }
 
   (*func)(args.data());
+
+  for (auto it : dimDatas) {
+    free(it);
+  }
 
   // Free everything after the body executes.
   for (auto it : argData) {
@@ -610,13 +681,50 @@ mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, LegateTypeCode typ) {
   }
 }
 
-mlir::MemRefType buildMemRefTypeOfDim(mlir::MLIRContext* ctx, int32_t ndim, LegateTypeCode typ) {
+mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreDescriptor& desc) {
+  // Construct the components needed for the basic memref type.
+  auto typ = coreTypeToMLIRType(ctx, desc.typ);
   llvm::SmallVector<int64_t, 4> dims;
-  dims.reserve(ndim);
-  for (int32_t i = 0; i < ndim; i++) {
+  dims.reserve(desc.ndim);
+  for (int32_t i = 0; i < desc.ndim; i++) {
     dims.push_back(mlir::ShapedType::kDynamic);
   }
-  return mlir::MemRefType::get(dims, coreTypeToMLIRType(ctx, typ));
+
+  // Now use the transform stack to construct an affine map from the transformed store
+  // to the physical layout of the store at runtime. We'll start with the an identity
+  // initial map, and then apply transformations on it in reverse order to construct
+  // the final mapping.
+  auto affineMap = mlir::AffineMap::getMultiDimIdentityMap(desc.ndim, ctx);
+
+  desc.transform->iter_transforms([&](StoreTransform* ptr) {
+    // Apply the inverse transformation as specified by the input
+    // transform to the result of the affine map.
+    if (Promote* promote = dynamic_cast<Promote*>(ptr); promote != nullptr) {
+      auto dim = promote->get_extra_dim();
+      auto results = affineMap.getResults();
+
+      // We have to handle the case of a single dimension that was promoted
+      // separately, i.e. a scalar store promoted into a multi-dimensional
+      // object separately from the case of just dropping a dimension.
+      if (results.size() == 1) {
+        assert(dim == 0);
+        affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), mlir::getAffineConstantExpr(0, ctx), ctx);
+      } else {
+        // In the standard case, just drop the promoted dimension
+        // from the affine map.
+        llvm::SmallVector<mlir::AffineExpr, 4> newExpr;
+        for (size_t i = 0; i < results.size(); i++) {
+          if (i == dim) continue;
+          newExpr.push_back(results[i]);
+        }
+        affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), newExpr, ctx);
+      }
+    } else {
+      assert(false);
+    }
+  });
+
+  return mlir::MemRefType::get(dims, typ, affineMap);
 }
 
 }

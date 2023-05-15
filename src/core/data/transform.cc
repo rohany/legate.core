@@ -74,6 +74,13 @@ void TransformStack::print(std::ostream& out) const
   }
 }
 
+void TransformStack::iter_transforms(const std::function<void (StoreTransform*)>& f) const {
+  if (identity()) return;
+
+  f(this->transform_.get());
+  this->parent_->iter_transforms(f);
+}
+
 std::unique_ptr<StoreTransform> TransformStack::pop()
 {
 #ifdef DEBUG_LEGATE
