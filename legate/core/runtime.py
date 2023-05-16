@@ -1472,8 +1472,6 @@ class Runtime:
                     outputs = [s.to_comp_time_store_desc() for s in op.outputs]
                     reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
 
-                    print(op.inputs)
-
                     # TODO (rohany): Pack the arguments into a buffer for the tasks.
                     builder = BufferBuilder()
                     for arg, dtype in op._scalar_args:

@@ -123,6 +123,7 @@ class Transpose : public StoreTransform {
 
  public:
   virtual int32_t target_ndim(int32_t source_ndim) const override;
+  const std::vector<int32_t>& get_axes() const { return this->axes_; }
 
  private:
   std::vector<int32_t> axes_;

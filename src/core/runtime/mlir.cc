@@ -719,6 +719,31 @@ mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreD
         }
         affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), newExpr, ctx);
       }
+    } else if (Shift* shift = dynamic_cast<Shift*>(ptr); shift != nullptr) {
+      // Right now, it seems like we don't have to do anything special when a shift
+      // transform has been applied, for the following reasons. If any of these reasons
+      // change, we might have to revisit this decision:
+      // 1) Right now we generate 0 to dim loops, and assume that the memrefs point
+      //    onto the base of the allocation.
+      // 2) Because of 1), the accessor construction takes into account the shift
+      //    because the region requirement is constructed based on the shift from
+      //    the legate python side.
+    } else if (Transpose* transpose = dynamic_cast<Transpose*>(ptr); transpose != nullptr) {
+      auto& axes = transpose->get_axes();
+      auto results = affineMap.getResults();
+      llvm::SmallVector<mlir::AffineExpr, 4> newExpr(results.size());
+      // We're inverting the transform here. Since these vectors should
+      // be very small, we can do the dumb thing.
+      for (size_t i = 0; i < results.size(); i++) {
+        // Find the position where axes[j] == i;
+        for (size_t j = 0; j < results.size(); j++) {
+          if (axes[j] == i) {
+            newExpr[i] = results[j];
+            break;
+          }
+        }
+      }
+      affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), newExpr, ctx);
     } else {
       assert(false);
     }

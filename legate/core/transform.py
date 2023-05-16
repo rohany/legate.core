@@ -629,7 +629,10 @@ class TransformStack(TransformStackBase):
                 result.add_promote(tx)
             elif isinstance(tx, Shift):
                 result.add_shift(tx)
+            elif isinstance(tx, Transpose):
+                result.add_transpose(tx)
             else:
+                # print(type(tx))
                 assert(False)
         return result
 

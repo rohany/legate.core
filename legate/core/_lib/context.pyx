@@ -47,11 +47,12 @@ cdef extern from "core/data/transform.h" namespace "legate" nogil:
 
     cdef cppclass Promote:
         Promote(int32_t, int64_t)
-        # TODO (rohany): Do I need to expose the underlying dim_size or dim_?
 
     cdef cppclass Shift:
         Shift(int32_t dim, int64_t offset)
-        # TODO (rohany): Do I need to expose the underlying dim_ and offset_?
+
+    cdef cppclass Transpose:
+        Tranpose(vector[int32_t]&& axes)
 
 
 cdef class PyTransformStack:
@@ -72,6 +73,16 @@ cdef class PyTransformStack:
         cdef int offset = tx._offset
         self._stack = make_shared[TransformStack](
           make_unique[Shift](dim, offset),
+          move(self._stack)
+        )
+
+    def add_transpose(self, object tx):
+        cdef vector[int32_t] axes = vector[int32_t]()
+        cdef int32_t axis
+        for axis in tx._axes:
+            axes.push_back(axis)
+        self._stack = make_shared[TransformStack](
+          make_unique[Transpose](move(axes)),
           move(self._stack)
         )
 
