@@ -122,6 +122,50 @@ void TemporaryStorePromotionPass::runOnOperation() {
   //  pass at this point has no concept of store IDs.
 }
 
+IntermediateStorePrivilegeEscalationPass::IntermediateStorePrivilegeEscalationPass(
+  const std::vector<int32_t>& intermediateOrdinals,
+  const std::vector<int32_t>& ordinalMapping
+) : intermediateOrdinals_(intermediateOrdinals), ordinalMapping_(ordinalMapping) {}
+
+void IntermediateStorePrivilegeEscalationPass::runOnOperation() {
+  auto& ctx = this->getContext();
+  mlir::func::FuncOp op = this->getOperation();
+  auto& entryBlock = op.getBlocks().front();
+  auto numArgs = entryBlock.getNumArguments();
+  auto loc = mlir::NameLoc::get(mlir::StringAttr::get(&ctx, "intermediateStorePrivilegeEscalation"));
+  mlir::OpBuilder builder(&ctx);
+
+  std::vector<mlir::Value> intermediateStores(this->intermediateOrdinals_.size());
+  std::vector<mlir::Value> resolvedStores(this->ordinalMapping_.size());
+  llvm::BitVector argsToDelete(numArgs);
+  for (size_t i = 0; i < this->intermediateOrdinals_.size(); i++) {
+    intermediateStores[i] = entryBlock.getArgument(this->intermediateOrdinals_[i]);
+    resolvedStores[i] = entryBlock.getArgument(this->ordinalMapping_[i]);
+    argsToDelete.set(this->intermediateOrdinals_[i]);
+  }
+
+  // Replace uses of the escalated ordinals with the remapped ordinal.
+  for (size_t i = 0; i < intermediateStores.size(); i++) {
+    auto intermediate = intermediateStores[i];
+    auto resolved = resolvedStores[i];
+    intermediate.replaceAllUsesWith(resolved);
+  }
+  entryBlock.eraseArguments(argsToDelete);
+
+  // Finally adjust the function type to exclude the replaced arguments.
+  llvm::SmallVector<mlir::Type, 8> newArgTypes;
+  std::set<int32_t> tempOrdinals(this->intermediateOrdinals_.begin(), this->intermediateOrdinals_.end());
+  size_t idx = 0;
+  for (size_t i = 0; i < numArgs; i++) {
+    if (tempOrdinals.count(idx) == 0) {
+      newArgTypes.push_back(op.getArgumentTypes()[i]);
+    }
+    idx++;
+  }
+  auto newFuncType = builder.getFunctionType(newArgTypes, std::nullopt);
+  op.setFunctionType(newFuncType);
+}
+
 MemrefDimensionAccessNormalizingPass::MemrefDimensionAccessNormalizingPass() {}
 
 void MemrefDimensionAccessNormalizingPass::runOnOperation() {

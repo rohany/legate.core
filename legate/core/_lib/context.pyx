@@ -120,6 +120,11 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
           const vector[int32_t]&,
           const vector[int32_t]&
         )
+        void escalateIntermediateStorePrivilege(
+          MLIRRuntime*,
+          const vector[int32_t]&,
+          const vector[int32_t]&
+        )
         void optimize(MLIRRuntime*)
 
     ctypedef MLIRModule* MLIRModulePtr
@@ -297,6 +302,20 @@ cdef class PyMLIRModule:
           resolved_shape_ordinals_[i] = resolved_shape_ordinals_[i]
         cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
         self._module.get().promoteTemporaryStores(runtime, temporary_store_ordinals_, resolved_shape_ordinals_)
+
+    def escalateIntermediateStorePrivilege(
+        self,
+        list intermediate_store_ordinals,
+        list ordinal_mapping
+    ) -> None:
+        cdef vector[int32_t] intermediate_store_ordinals_ = vector[int32_t](len(intermediate_store_ordinals))
+        cdef vector[int32_t] ordinal_mapping_ = vector[int32_t](len(ordinal_mapping))
+        cdef int i
+        for i in range(len(intermediate_store_ordinals)):
+          intermediate_store_ordinals_[i] = intermediate_store_ordinals[i]
+          ordinal_mapping_[i] = ordinal_mapping[i]
+        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
+        self._module.get().escalateIntermediateStorePrivilege(runtime, intermediate_store_ordinals_, ordinal_mapping_)
 
     def optimize(self) -> None:
         cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()

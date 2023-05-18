@@ -116,6 +116,17 @@ class MLIRModule {
       const std::vector<int32_t>& resolutionOrdinalMapping
     );
 
+    // escalarateIntermediateStorePrivilege removes intermediate stores
+    // that are produced by tasks in the fused buffer from the inputs of
+    // a module so that they don't get launched with read-write privilege.
+    // Precisely, we promote the read-write privilege on the input stores
+    // to be only write privilege.
+    void escalateIntermediateStorePrivilege(
+      MLIRRuntime* runtime,
+      const std::vector<int32_t>& intermedateStoreOrdinals,
+      const std::vector<int32_t>& ordinalMapping
+    );
+
     // TODO (rohany): Run a couple passes on this module. In the future this
     //  will be opt in by different libraries, but for now we'll just have
     //  a couple pre-done passes.
@@ -192,5 +203,6 @@ public:
 
 mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, LegateTypeCode typ);
 mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreDescriptor& desc);
+std::pair<llvm::SmallVector<mlir::Value, 4>, llvm::SmallVector<mlir::Value, 4>> loopBoundsFromVar(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value var, int32_t ndim);
 
 }

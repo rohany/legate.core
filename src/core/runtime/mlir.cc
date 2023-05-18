@@ -438,6 +438,33 @@ void MLIRModule::promoteTemporaryStores(
   this->reducs_ = newReducs;
 }
 
+void MLIRModule::escalateIntermediateStorePrivilege(
+  MLIRRuntime* runtime,
+  const std::vector<int32_t>& intermediateStoreOrdinals,
+  const std::vector<int32_t>& ordinalMapping
+) {
+  auto ctx = runtime->getContext().get();
+  mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
+  mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
+  funcsPM.addPass(std::make_unique<TemporaryStorePromotionPass>(intermediateStoreOrdinals, ordinalMapping));
+
+  if (mlir::failed(pm.run(this->module_.get()))) {
+    assert(false);
+  }
+
+  // Remove the temporary stores from this module's metadata.
+  std::set<int32_t> tempOrdinals(intermediateStoreOrdinals.begin(), intermediateStoreOrdinals.end());
+  std::vector<CompileTimeStoreDescriptor> newInputs;
+  size_t idx = 0;
+  for (size_t i = 0; i < this->inputs_.size(); i++) {
+    if (tempOrdinals.count(idx) == 0) {
+      newInputs.push_back(this->inputs_[i]);
+    }
+    idx++;
+  }
+  this->inputs_ = newInputs;
+}
+
 void MLIRModule::optimize(MLIRRuntime* runtime) {
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
@@ -625,9 +652,7 @@ void MLIRTask::body(TaskContext& context) {
 mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, LegateTypeCode typ) {
   switch (typ) {
     case LegateTypeCode::BOOL_LT: {
-      // TODO (rohany): MLIR doesn't have boolean types???
-      assert(false);
-      return mlir::Float16Type::get(ctx);
+      return mlir::IntegerType::get(ctx, 1, mlir::IntegerType::SignednessSemantics::Signless);
     }
     case LegateTypeCode::INT8_LT: {
       return mlir::IntegerType::get(ctx, 8, mlir::IntegerType::SignednessSemantics::Signed);
@@ -750,6 +775,21 @@ mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreD
   });
 
   return mlir::MemRefType::get(dims, typ, affineMap);
+}
+
+std::pair<llvm::SmallVector<mlir::Value, 4>, llvm::SmallVector<mlir::Value, 4>> loopBoundsFromVar(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value var, int32_t ndim) {
+  // TODO (rohany): In the future, this could be templated on LEGATE_CORE_MAX_DIM (or whatever it's called).
+  llvm::SmallVector<mlir::Value, 4> loopLBs, loopUBs;
+  loopLBs.reserve(ndim);
+  loopUBs.reserve(ndim);
+
+  auto zeroIndex = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+  for (int32_t i = 0; i < ndim; i++) {
+    loopLBs.push_back(zeroIndex);
+    loopUBs.push_back(builder.create<mlir::memref::DimOp>(loc, var, int64_t(i)));
+  }
+
+  return {loopLBs, loopUBs};
 }
 
 }

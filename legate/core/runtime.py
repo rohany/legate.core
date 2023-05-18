@@ -1589,11 +1589,10 @@ class Runtime:
                 defined_storages = set()
                 for op in ops:
                     for store in op.outputs:
-                        defined_storages.add(store.storage)
+                        defined_storages.add(store._storage._unique_id)
 
-                # TODO (rohany): Scalar stores are getting marked as temporary??
                 for store in new_inputs:
-                    if not store.has_external_references() and store.storage in defined_storages:
+                    if not store.has_external_references() and store._storage._unique_id in defined_storages:
                         temporaries.append(store)
                         temporary_store_ordinals.append(index)
                     else:
@@ -1619,6 +1618,8 @@ class Runtime:
                 #     index += 1
                 new_inputs, new_outputs = durable_inputs, durable_outputs
 
+                # print([store._unique_id for store in new_inputs], [store._unique_id for store in new_outputs])
+
                 store_id_to_index_mapping = {}
                 index = 0
                 # TODO (rohany): Haven't yet handled when the same store appears in
@@ -1631,9 +1632,10 @@ class Runtime:
                 # the shape of the local allocation. For now, this just means finding
                 # another store in the argument list that uses the same partition.
                 resolved_shape_ordinals = []
+                temporary_set = set(temporaries)
                 for temporary in temporaries:
                     part = store_parts[temporary]
-                    other_stores = same_partitions[part] - {temporary}
+                    other_stores = same_partitions[part] - temporary_set
                     resolved = next(iter(other_stores))
                     resolved_shape_ordinals.append(store_id_to_index_mapping[resolved._unique_id])
 
@@ -1643,13 +1645,72 @@ class Runtime:
 
                 ######### Done Temporary Elimination
 
+                ######### Intermediate store privilege escalation pass
+
+                # Since we are fusing multiple tasks together, there is some
+                # funkiness around privileges that we also need to handle. In
+                # particular, consider when a task T1 defines an output S, which
+                # T2 uses as input. In a standard execution, this is fine. However,
+                # when we fuse T1 and T2, we would add S as input and output to
+                # fused(T1, T2). This is a problem, as then we'll ask for read-write
+                # permissions on S, even though it hasn't yet been written to before
+                # the read. This pass eliminates S from the input of the fused task,
+                # and just treats it as output. This isn't just a metadata transformation,
+                # as we need to remove the stores from the arguments of the generated.
+                defined_by_op = []
+                for op in ops:
+                    cur_defs = set([store._storage._unique_id for store in op.outputs])
+                    if len(defined_by_op) == 0:
+                        defined_by_op.append(cur_defs)
+                    else:
+                        defined_by_op.append(cur_defs.union(defined_by_op[-1]))
+                defined_before_used = set()
+                for i in range(len(ops)):
+                    op = ops[i]
+                    if i > 0:
+                        for store in op.inputs:
+                            if store._storage._unique_id in defined_by_op[i - 1]:
+                                defined_before_used.add(store._storage._unique_id)
+
+                inputs_after_intermediate_promotion = []
+                intermediate_input_indexes = []
+                intermediates = []
+                index = 0
+                for input in new_inputs:
+                    if input._storage._unique_id not in defined_before_used:
+                        inputs_after_intermediate_promotion.append(input)
+                    else:
+                        intermediate_input_indexes.append(index)
+                        intermediates.append(input)
+                    index += 1
+                resolved_input_indexes = []
+                for input in intermediates:
+                    # TODO (rohany): We can accelerate this search later.
+                    for i, store in enumerate(new_outputs):
+                        if store._unique_id == input._unique_id:
+                            resolved_input_indexes.append(i + len(new_inputs))
+                            break
+
+                new_inputs = inputs_after_intermediate_promotion
+                fused.escalateIntermediateStorePrivilege(intermediate_input_indexes, resolved_input_indexes)
+
+                # TODO (rohany): Every time we change the set of inputs and outputs we have
+                #  to recompute this mapping.
+                store_id_to_index_mapping = {}
+                index = 0
+                # TODO (rohany): Haven't yet handled when the same store appears in
+                #  both the inputs and outputs here.
+                for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                    store_id_to_index_mapping[store._unique_id] = index
+                    index += 1
+
                 ######### Standard pass application
 
                 fused.optimize()
 
                 ######### Done standard pass application
 
-                fused.dump()
+                # fused.dump()
 
 
                 # TODO (rohany): At this point, all of the analysis being done to the
@@ -1658,6 +1719,7 @@ class Runtime:
                 # TODO (rohany): Worry about caching this fused task later.
                 fused.lowerToLLVMDialect()
                 funcptr = fused.jitToLLVM()
+
                 # TODO (rohany): Worry about when these ops come from different libraries.
                 local_task_id = ops[0].context.get_fresh_local_task_id()
                 PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id))
@@ -1736,15 +1798,18 @@ class Runtime:
                     # other than a list of all the stores they access. We can also
                     # assume that the tasks generators don't get to use any information
                     # about the stores other than their data types and number of dimensions.
-                    #
-                    # TODO (rohany): I actually take that back, it looks like we have to pass
-                    #  some extra information to task body generation even for getting binary
-                    #  operations to work, since a single binary op definition is used for
-                    #  every operation. I'm not sure what the API for this should be. Ideally
-                    #  the Python users should be able to pass a blob of bytes through to the
-                    #  generator function, which is able to interpret that as whatever is necessary.
-                    module = gen.generate_body(inputs, outputs, reducs)
+                    builder = BufferBuilder()
+                    for arg, dtype in op._scalar_args:
+                        scalar = ScalarArg(self._core_context.type_system, arg, dtype)
+                        scalar.pack(builder)
+                    buffer = bytes(builder.get_string())
+                    bufSize = builder.get_size()
+
+                    module = gen.generate_body(inputs, outputs, reducs, buffer, bufSize)
+                    # module.dump()
+                    module.optimize()
                     module.lowerToLLVMDialect()
+                    # module.dump()
                     funcptr = module.jitToLLVM()
                     local_task_id = op.context.get_fresh_local_task_id()
                     PyMLIRTask.register_variant("JITTED_SINGLE_TASK", op.context.get_task_id(local_task_id))

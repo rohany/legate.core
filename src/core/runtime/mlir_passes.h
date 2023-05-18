@@ -45,6 +45,17 @@ class TemporaryStorePromotionPass
   const std::vector<int32_t>& resolutionOrdinalMapping_;
 };
 
+class IntermediateStorePrivilegeEscalationPass
+  : public mlir::PassWrapper<IntermediateStorePrivilegeEscalationPass, mlir::OperationPass<mlir::func::FuncOp>> {
+ public:
+  IntermediateStorePrivilegeEscalationPass(const std::vector<int32_t>& intermediateOrdinals,
+                                           const std::vector<int32_t>& ordinalMapping);
+  void runOnOperation() final;
+ private:
+  const std::vector<int32_t>& intermediateOrdinals_;
+  const std::vector<int32_t>& ordinalMapping_;
+};
+
 class MemrefDimensionAccessNormalizingPass :
   public mlir::PassWrapper<MemrefDimensionAccessNormalizingPass, mlir::OperationPass<mlir::func::FuncOp>> {
   public:
