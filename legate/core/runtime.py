@@ -1718,6 +1718,8 @@ class Runtime:
 
                 # TODO (rohany): Worry about caching this fused task later.
                 fused.lowerToLLVMDialect()
+
+                # fused.dump()
                 funcptr = fused.jitToLLVM()
 
                 # TODO (rohany): Worry about when these ops come from different libraries.
@@ -1773,6 +1775,10 @@ class Runtime:
             # Try to replace tasks by JIT-ed variants, and remap the partitioning
             # strategy of the tasks over to the newly created task.
             for i in range(len(ops)):
+                # TODO (rohany): Temporarily disable the jitting of single tasks.
+                break
+
+
                 op, strategy = ops[i], strategies[i]
                 if not settings.kernel_fusion():
                     continue

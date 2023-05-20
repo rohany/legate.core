@@ -63,4 +63,25 @@ class MemrefDimensionAccessNormalizingPass :
    void runOnOperation() final;
 };
 
+// TODO (rohany): ............
+// TODO (rohany): WHY IS THIS HERE>>>>>>>>>>>>>>>>> RTTI NONSENSE
+/// A simple object cache following Lang's LLJITWithObjectCache example.
+class SimpleObjectCache : public llvm::ObjectCache {
+public:
+  void notifyObjectCompiled(const llvm::Module *m,
+                            llvm::MemoryBufferRef objBuffer) override;
+  std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module *m) override;
+
+  /// Dump cached object to output file `filename`.
+  void dumpToObjectFile(llvm::StringRef filename);
+
+  void dumpAllObjectsToFile(llvm::StringRef filename);
+
+  /// Returns `true` if cache hasn't been populated yet.
+  bool isEmpty();
+
+private:
+  llvm::StringMap<std::unique_ptr<llvm::MemoryBuffer>> cachedObjects;
+};
+
 }

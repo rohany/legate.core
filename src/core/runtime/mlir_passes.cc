@@ -14,10 +14,16 @@
  *
  */
 
+#include "llvm/ExecutionEngine/ObjectCache.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/ExecutionEngine/Orc/CompileUtils.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
+
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/FileUtilities.h"
 
 #include "core/runtime/mlir_passes.h"
 
@@ -212,5 +218,56 @@ void MemrefDimensionAccessNormalizingPass::runOnOperation() {
   auto newFuncType = builder.getFunctionType(argTypes, std::nullopt);
   op.setFunctionType(newFuncType);
 }
+
+void SimpleObjectCache::notifyObjectCompiled(const llvm::Module *m,
+                                             llvm::MemoryBufferRef objBuffer) {
+  cachedObjects[m->getModuleIdentifier()] = llvm::MemoryBuffer::getMemBufferCopy(
+      objBuffer.getBuffer(), objBuffer.getBufferIdentifier());
+}
+
+std::unique_ptr<llvm::MemoryBuffer> SimpleObjectCache::getObject(const llvm::Module *m) {
+  auto i = cachedObjects.find(m->getModuleIdentifier());
+  if (i == cachedObjects.end()) {
+    // LLVM_DEBUG(llvm::dbgs() << "No object for " << m->getModuleIdentifier()
+    //                   << " in cache. Compiling.\n");
+    return nullptr;
+  }
+  // LLVM_DEBUG(llvm::dbgs() << "Object for " << m->getModuleIdentifier()
+  //                   << " loaded from cache.\n");
+  return llvm::MemoryBuffer::getMemBuffer(i->second->getMemBufferRef());
+}
+
+void SimpleObjectCache::dumpToObjectFile(llvm::StringRef outputFilename) {
+  // Set up the output file.
+  std::string errorMessage;
+  auto file = mlir::openOutputFile(outputFilename, &errorMessage);
+  if (!file) {
+    llvm::errs() << errorMessage << "\n";
+    return;
+  }
+
+  // Dump the object generated for a single module to the output file.
+  assert(cachedObjects.size() == 1 && "Expected only one object entry.");
+  auto &cachedObject = cachedObjects.begin()->second;
+  file->os() << cachedObject->getBuffer();
+  file->keep();
+}
+
+void SimpleObjectCache::dumpAllObjectsToFile(llvm::StringRef filename) {
+  for (auto& it : this->cachedObjects) {
+    auto outfilename = filename.str() + it.first().str() + ".o";
+    // Set up the output file.
+    std::string errorMessage;
+    auto file = mlir::openOutputFile(outfilename, &errorMessage);
+    if (!file) {
+      llvm::errs() << errorMessage << "\n";
+      return;
+    }
+    file->os() << it.second->getBuffer();
+    file->keep();
+  }
+}
+
+bool SimpleObjectCache::isEmpty() { return cachedObjects.empty(); }
 
 }

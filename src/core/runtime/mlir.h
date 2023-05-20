@@ -56,9 +56,11 @@ class MLIRRuntime {
    std::unique_ptr<llvm::TargetMachine>& getTargetMachine();
    std::function<llvm::Error(llvm::Module*)>& getOptTransformer();
    std::unique_ptr<llvm::orc::LLJIT>& getJIT();
+   std::unique_ptr<SimpleObjectCache>& getObjectCache();
    int64_t getNextJITID();
 
    void dumpMLIR(mlir::Operation* op);
+   void dumpAllObjects();
  private:
   // MLIR related state.
   mlir::DialectRegistry registry;
@@ -76,6 +78,7 @@ class MLIRRuntime {
   // std::unique_ptr<llvm::LLVMContext> llvmContext;
   std::unique_ptr<llvm::TargetMachine> targetMachine;
   std::unique_ptr<llvm::orc::LLJIT> jit;
+  std::unique_ptr<SimpleObjectCache> objectCache;
   int64_t jitFunctionCtr = 0;
 };
 

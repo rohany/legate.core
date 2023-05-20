@@ -21,7 +21,11 @@
 
 #include "legion.h"
 
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/ExecutionEngine/JITEventListener.h"
+#include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
@@ -29,7 +33,10 @@
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ToolOutputFile.h"
+
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -37,6 +44,9 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+// #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Affine/Passes.h"
@@ -44,6 +54,7 @@
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -52,6 +63,67 @@
 #include <iostream>
 
 namespace legate {
+
+static std::optional<llvm::OptimizationLevel> mapToLevel(unsigned optLevel,
+                                                   unsigned sizeLevel) {
+  switch (optLevel) {
+  case 0:
+    return llvm::OptimizationLevel::O0;
+
+  case 1:
+    return llvm::OptimizationLevel::O1;
+
+  case 2:
+    switch (sizeLevel) {
+    case 0:
+      return llvm::OptimizationLevel::O2;
+
+    case 1:
+      return llvm::OptimizationLevel::Os;
+
+    case 2:
+      return llvm::OptimizationLevel::Oz;
+    }
+    break;
+  case 3:
+    return llvm::OptimizationLevel::O3;
+  }
+  return std::nullopt;
+}
+
+std::function<llvm::Error(llvm::Module *)>
+makeOptimizingTransformer(unsigned optLevel, unsigned sizeLevel,
+                                llvm::TargetMachine *targetMachine) {
+  return [optLevel, sizeLevel, targetMachine](llvm::Module *m) -> llvm::Error {
+    std::optional<llvm::OptimizationLevel> ol = mapToLevel(optLevel, sizeLevel);
+    if (!ol) {
+      assert(false);
+    }
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+
+    llvm::PipelineTuningOptions tuningOptions;
+    tuningOptions.LoopUnrolling = true;
+    tuningOptions.LoopInterleaving = true;
+    // tuningOptions.LoopVectorization = true;
+    // tuningOptions.SLPVectorization = true;
+
+    llvm::PassBuilder pb(targetMachine, tuningOptions);
+
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    llvm::ModulePassManager mpm;
+    mpm.addPass(pb.buildPerModuleDefaultPipeline(*ol));
+    mpm.run(*m, mam);
+    return llvm::Error::success();
+  };
+}
 
 MLIRRuntime::MLIRRuntime() {
   std::cout << "Initializing MLIRRuntime." << std::endl;
@@ -87,6 +159,7 @@ MLIRRuntime::MLIRRuntime() {
   auto tmOrError = tmBuilderOrError->createTargetMachine();
   assert(tmOrError);
   this->targetMachine = std::move(tmOrError.get());
+  this->objectCache = std::make_unique<SimpleObjectCache>();
 
   // Callback to create the object layer with symbol resolution to current
   // process and dynamically linked libraries.
@@ -101,10 +174,10 @@ MLIRRuntime::MLIRRuntime() {
   auto compileFunctionCreator = [&](llvm::orc::JITTargetMachineBuilder jtmb)
       -> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
     // We want optimized code, -O3.
-    jtmb.setCodeGenOptLevel(llvm::CodeGenOpt::Level::Aggressive);
+    jtmb.setCodeGenOptLevel(llvm::CodeGenOpt::Level::Default);
     // TODO (rohany): Not currently including a cache, as I think we'll
     //  manage caching at a higher level of the system than this.
-    return std::make_unique<llvm::orc::SimpleCompiler>(*this->targetMachine, nullptr /* cache */);
+    return std::make_unique<llvm::orc::SimpleCompiler>(*this->targetMachine, this->objectCache.get());
   };
 
   auto dataLayout = this->targetMachine->createDataLayout();
@@ -117,7 +190,7 @@ MLIRRuntime::MLIRRuntime() {
   ));
   // Construct an optimizing transformer to pass to the JIT later
   // when we add a module to it.
-  this->llvmOptTransformer = mlir::makeOptimizingTransformer(3, 0, nullptr /* targetMachine */);
+  this->llvmOptTransformer = makeOptimizingTransformer(2, 0, nullptr /* targetMachine */);
 
   // Resolve symbols that are statically linked in the current process.
   llvm::orc::JITDylib &mainJD = this->jit->getMainJITDylib();
@@ -151,6 +224,10 @@ std::unique_ptr<llvm::orc::LLJIT>& MLIRRuntime::getJIT() {
   return this->jit;
 }
 
+std::unique_ptr<SimpleObjectCache>& MLIRRuntime::getObjectCache() {
+  return this->objectCache;
+}
+
 int64_t MLIRRuntime::getNextJITID() {
   return this->jitFunctionCtr++;
 }
@@ -160,6 +237,11 @@ void MLIRRuntime::dumpMLIR(mlir::Operation* op) {
   op->print(llvm::outs(), asmState);
   llvm::outs() << "\n";
 }
+
+void MLIRRuntime::dumpAllObjects() {
+  this->objectCache->dumpAllObjectsToFile("legate_kernels");
+}
+
 
 static std::string makePackedFunctionName(llvm::StringRef name) {
   return "_mlir_" + name.str();
@@ -247,31 +329,71 @@ MLIRModule::MLIRModule(
   ) : module_(std::move(module)), kernelName_(kernelName), inputs_(inputs), outputs_(outputs), reducs_(reducs) {}
 
 void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
-  // TODO (rohany): Eventually, this will need to accept input from individual
-  //  libraries about how to lower things.
+
+  // TODO (rohany): Also need to run some explicit passes here?
   auto ctx = runtime->getContext().get();
-  mlir::LLVMConversionTarget convTarget(*ctx);
-  convTarget.addLegalOp<mlir::ModuleOp>();
-  mlir::LLVMTypeConverter typeConverter(ctx);
-  mlir::RewritePatternSet patterns(ctx);
-  mlir::populateAffineToStdConversionPatterns(patterns);
-  mlir::populateSCFToControlFlowConversionPatterns(patterns);
-  mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::populateOpenMPToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-  if (mlir::failed(mlir::applyFullConversion(this->module_.get(), convTarget, frozenPatterns))) {
+  mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
+
+  {
+    // TODO (rohany): This should be backend specific?
+    mlir::ConvertVectorToLLVMPassOptions opts{};
+    opts.x86Vector = true;
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertSCFToCFPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createExpandStridedMetadataPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
+    pm.addPass(mlir::createConvertVectorToLLVMPass(opts));
+    pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+    pm.addPass(mlir::createConvertMathToLLVMPass());
+    pm.addPass(mlir::createConvertMathToLibmPass());
+    // pm.addPass(mlir::createConvertVectorToLLVMPass(opts));
+    // TODO (rohany): Add in math / complex to libm passes?
+    pm.addPass(mlir::createConvertFuncToLLVMPass());
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+  }
+
+  if (mlir::failed(pm.run(this->module_.get()))) {
+    std::cout << "Failed passes in lower to LLVM" << std::endl;
+    runtime->dumpMLIR(this->module_.get());
     assert(false);
   }
+
+
+
+  // TODO (rohany): Eventually, this will need to accept input from individual
+  //  libraries about how to lower things.
+  // mlir::LLVMConversionTarget convTarget(*ctx);
+  // convTarget.addLegalOp<mlir::ModuleOp>();
+  // mlir::LLVMTypeConverter typeConverter(ctx);
+  // mlir::RewritePatternSet patterns(ctx);
+  // mlir::populateAffineToStdConversionPatterns(patterns);
+  // mlir::populateSCFToControlFlowConversionPatterns(patterns);
+  // mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+  // mlir::populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
+  // mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
+  // mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+  // mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
+  // mlir::populateVectorToLLVMConversionPatterns(typeConverter, patterns);
+  // // mlir::populateOpenMPToLLVMConversionPatterns(typeConverter, patterns);
+  // mlir::FrozenRewritePatternSet frozenPatterns(std::move(patterns));
+  // if (mlir::failed(mlir::applyFullConversion(this->module_.get(), convTarget, frozenPatterns))) {
+  //   std::cout << "Failed LLVM Conversion of this module: " << std::endl;
+  //   runtime->dumpMLIR(this->module_.get());
+  //   assert(false);
+  // }
+  // std::cout << "After LLVM Conversion: " << std::endl;
+  // runtime->dumpMLIR(this->module_.get());
 }
 
 uintptr_t MLIRModule::jitToLLVM(MLIRRuntime* runtime) {
   // Now, add the module to the JIT, invoke it, and return a function pointer to the generated code.
   std::unique_ptr<llvm::LLVMContext> llvmContext = std::make_unique<llvm::LLVMContext>();
-  auto llvmModule = mlir::translateModuleToLLVMIR(this->module_.get(), *llvmContext);
+  auto llvmModule = mlir::translateModuleToLLVMIR(this->module_.get(), *llvmContext, this->kernelName_);
+  if (!llvmModule) {
+    std::cout << "Failed translateModuletoLLVM: " << std::endl;
+    runtime->dumpMLIR(this->module_.get());
+  }
   assert(llvmModule);
 
   // TODO: Currently, the LLVM module created above has no triple associated
@@ -285,6 +407,7 @@ uintptr_t MLIRModule::jitToLLVM(MLIRRuntime* runtime) {
 
   llvm::orc::ThreadSafeModule tsm(std::move(llvmModule), std::move(llvmContext));
   llvm::cantFail(tsm.withModuleDo([&](llvm::Module& module) { return runtime->getOptTransformer()(&module); }));
+
   // TODO (rohany): We have to eventually delete this IR module as well.
   auto& jit = runtime->getJIT();
   llvm::cantFail(jit->addIRModule(std::move(tsm)));
@@ -292,6 +415,9 @@ uintptr_t MLIRModule::jitToLLVM(MLIRRuntime* runtime) {
   // Now get the function pointer out from the JIT. It won't compile
   // anything until we actually ask for a particular symbol.
   auto expectedSymbol = jit->lookup(makePackedFunctionName("_mlir_ciface_" + this->kernelName_));
+
+  // TODO (rohany): Change this to take in the symbol name.
+  // runtime->getObjectCache()->dumpToObjectFile("legate_kernel.o");
 
   // JIT lookup may return an Error referring to strings stored internally by
   // the JIT. If the Error outlives the ExecutionEngine, it would want have a
@@ -482,7 +608,22 @@ void MLIRModule::optimize(MLIRRuntime* runtime) {
     mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
     funcsPM.addPass(std::make_unique<MemrefDimensionAccessNormalizingPass>());
     funcsPM.addPass(mlir::createAffineLoopInvariantCodeMotionPass());
+    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+    std::vector<int64_t> vectorSizes(1, 4);
+    mlir::AffineVectorizeOptions options;
+    options.vectorSizes = vectorSizes;
+    funcsPM.addPass(mlir::createAffineVectorize(options));
+    // funcsPM.addPass(mlir::createLoopUnrollPass());
   }
+
+  pm.addPass(mlir::createCSEPass());
+
+  // {
+  //   mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
+  //   mlir::VectorTransferToSCFOptions options;
+  //   funcsPM.addPass(mlir::createConvertVectorToSCFPass(options));
+  // }
 
   // pm.enableIRPrinting();
 

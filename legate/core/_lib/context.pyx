@@ -96,6 +96,7 @@ cdef class PyTransformStack:
 cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
     cdef cppclass MLIRRuntime:
         int getNextJITID()
+        void dumpAllObjects()
 
     cdef cppclass MLIRTask:
         @staticmethod
@@ -402,6 +403,10 @@ cdef class CppRuntime:
     @staticmethod
     def initializeMLIRRuntime():
         Runtime.get_runtime().initializeMLIRRuntime()
+
+    @staticmethod
+    def dumpMLIRObjects():
+        Runtime.get_runtime().getMLIRRuntime().dumpAllObjects()
 
 
 cdef class Context:
