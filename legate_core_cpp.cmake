@@ -307,11 +307,13 @@ target_include_directories(legate_core PUBLIC ${LLVM_INCLUDE_DIRS})
 target_include_directories(legate_core PUBLIC ${MLIR_INCLUDE_DIRS})
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
+get_property(translation_libs GLOBAL PROPERTY MLIR_TRANSLATION_LIBS)
 llvm_map_components_to_libnames(llvm_libs support core)
 target_link_libraries(legate_core
  PRIVATE
    ${dialect_libs}
    ${conversion_libs}
+   ${translation_libs}
    ${llvm_libs}
    MLIRIR
    MLIROptLib

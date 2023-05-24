@@ -44,9 +44,11 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-// #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Affine/Passes.h"
@@ -57,6 +59,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -133,6 +136,7 @@ MLIRRuntime::MLIRRuntime() {
   mlir::registerAllPasses();
   mlir::registerBuiltinDialectTranslation(this->registry);
   mlir::registerLLVMDialectTranslation(this->registry);
+  mlir::registerOpenMPDialectTranslation(this->registry);
 
   // Create the MLIRContext once all of the dialects and
   // passes have been registered.
@@ -334,6 +338,7 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
 
+  // TODO (rohany): This is a lowering pipeline for single-threaded CPU vector operations.
   {
     // TODO (rohany): This should be backend specific?
     mlir::ConvertVectorToLLVMPassOptions opts{};
@@ -352,6 +357,20 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
     pm.addPass(mlir::createConvertFuncToLLVMPass());
     pm.addPass(mlir::createReconcileUnrealizedCastsPass());
   }
+
+  // TODO (rohany): This is a lowering pipeline for OpenMP operations.
+  // TODO (rohany): I need to get this to work with vectorization too.
+  // {
+  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
+  //   pm.addPass(mlir::createConvertSCFToOpenMPPass());
+  //   pm.addPass(mlir::createConvertOpenMPToLLVMPass());
+  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createExpandStridedMetadataPass());
+  //   pm.addPass(mlir::createConvertMathToLLVMPass());
+  //   pm.addPass(mlir::createConvertMathToLibmPass());
+  //   pm.addPass(mlir::createConvertFuncToLLVMPass());
+  //   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+  // }
 
   if (mlir::failed(pm.run(this->module_.get()))) {
     std::cout << "Failed passes in lower to LLVM" << std::endl;
@@ -593,6 +612,7 @@ void MLIRModule::escalateIntermediateStorePrivilege(
 
 void MLIRModule::optimize(MLIRRuntime* runtime) {
   auto ctx = runtime->getContext().get();
+  // TODO (rohany): Update these to just use addNestedPass<>.
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
   {
     mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
@@ -616,6 +636,12 @@ void MLIRModule::optimize(MLIRRuntime* runtime) {
     funcsPM.addPass(mlir::createAffineVectorize(options));
     // funcsPM.addPass(mlir::createLoopUnrollPass());
   }
+
+  // Passes for targeting OpenMP processors.
+  // TODO (rohany): Can't use this in conjunction with the vectorization pass unfortunately.
+  // {
+  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineParallelizePass());
+  // }
 
   pm.addPass(mlir::createCSEPass());
 
@@ -655,6 +681,16 @@ void MLIRTask::register_variant(std::string& name, int task_id) {
     constexpr auto wrapper = detail::legate_task_wrapper<MLIRTask::body>;
     runtime->register_task_variant(registrar, Legion::CodeDescriptor(wrapper), nullptr, 0, LEGATE_MAX_SIZE_SCALAR_RETURN, LegateVariantCode::LEGATE_CPU_VARIANT);
   }
+
+  // TODO (rohany): Control which processor we do the registration for.
+  // {
+  //   Legion::TaskVariantRegistrar registrar(task_id, false /* global */, "OMP");
+  //   registrar.add_constraint(Legion::ProcessorConstraint(Legion::Processor::Kind::OMP_PROC));
+  //   registrar.set_leaf();
+  //   constexpr auto wrapper = detail::legate_task_wrapper<MLIRTask::body>;
+  //   runtime->register_task_variant(registrar, Legion::CodeDescriptor(wrapper), nullptr, 0, LEGATE_MAX_SIZE_SCALAR_RETURN, LegateVariantCode::LEGATE_OMP_VARIANT);
+  // }
+
 }
 
 template<typename ACC, typename T, int N>
