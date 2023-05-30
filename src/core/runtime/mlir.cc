@@ -650,10 +650,10 @@ void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
 
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
   pm.addNestedPass<mlir::func::FuncOp>(mlir::createCSEPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopFusionPass(0, 0, true, mlir::FusionMode::Greedy));
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createLoopFusionPass(0, 0, true, mlir::affine::FusionMode::Greedy));
   // TODO (rohany): Investigate how many of these are needed...
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
 
   // TODO (rohany): Eventually move this out of the "optimize" function.
   // TODO (rohany): Why did I write this? Maybe it was because this is a correctness
@@ -661,21 +661,21 @@ void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
   pm.addPass(mlir::memref::createNormalizeMemRefsPass());
 
   pm.addNestedPass<mlir::func::FuncOp>(std::make_unique<MemrefDimensionAccessNormalizingPass>());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineLoopInvariantCodeMotionPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopInvariantCodeMotionPass());
   // TODO (rohany): Investigate how many of these are needed...
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
 
   // TODO (rohany): Until I can get vectorization and parallelization to work, I'm
   //  going to separate this out into a target-specific optimization.
   if (code == LegateVariantCode::LEGATE_CPU_VARIANT) {
     // TODO (rohany): Get vector size from CMake.
     std::vector<int64_t> vectorSizes(1, 4);
-    mlir::AffineVectorizeOptions options;
+    mlir::affine::AffineVectorizeOptions options;
     options.vectorSizes = vectorSizes;
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineVectorize(options));
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineVectorize(options));
   } else {
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineParallelizePass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineParallelizePass());
   }
 
   // Some of the other passes can introduce some extra IR that is easy to

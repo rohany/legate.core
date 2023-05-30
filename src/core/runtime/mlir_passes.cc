@@ -205,7 +205,7 @@ void MemrefDimensionAccessNormalizingPass::runOnOperation() {
       if (!mlir::isa<mlir::memref::DimOp>(user)) { continue; }
       mlir::memref::DimOp dimOp = mlir::cast<mlir::memref::DimOp>(user);
       builder.setInsertionPoint(user);
-      auto newDim = builder.create<mlir::AffineLoadOp>(loc, newArg, dimOp.getIndex());
+      auto newDim = builder.create<mlir::affine::AffineLoadOp>(loc, newArg, dimOp.getIndex());
       user->replaceAllUsesWith(newDim);
       toErase.push_back(user);
     }
