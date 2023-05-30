@@ -1426,6 +1426,11 @@ class Runtime:
                 continue
 
         if should_try_fuse and settings.kernel_fusion():
+            # TODO (rohany): Have to change this to ask for
+            #  feedback from the generated tasks, whether they can
+            #  target the same task variants or not etc.
+            target_variant = self.core_task_variant_id
+
             store_parts: dict[Store, PartitionBase] = {}
             all_eq = True
             def check_store_part(store, part):
@@ -1706,7 +1711,7 @@ class Runtime:
 
                 ######### Standard pass application
 
-                fused.optimize()
+                fused.optimize(target_variant)
 
                 ######### Done standard pass application
 
@@ -1717,14 +1722,14 @@ class Runtime:
                 #  task should be finished.
 
                 # TODO (rohany): Worry about caching this fused task later.
-                fused.lowerToLLVMDialect()
+                fused.lowerToLLVMDialect(target_variant)
 
                 # fused.dump()
                 funcptr = fused.jitToLLVM()
 
                 # TODO (rohany): Worry about when these ops come from different libraries.
                 local_task_id = ops[0].context.get_fresh_local_task_id()
-                PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id))
+                PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id), target_variant)
                 newTask = ops[0].context.create_auto_task(local_task_id)
                 for input in new_inputs:
                     newTask.add_input(input)

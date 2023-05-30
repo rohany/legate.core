@@ -144,6 +144,12 @@ AccessorRO<T, DIM> FutureWrapper::read_accessor() const
 #ifdef DEBUG_LEGATE
   assert(sizeof(T) == field_size_);
 #endif
+  // Generated tasks might access future data on the host before launching
+  // tasks. In this case, we need to make sure that future data is actually
+  // addressable on the host.
+  auto proc = Processor::get_executing_processor();
+  auto memkind = (proc.kind() == Processor::TOC_PROC) ? Memory::Z_COPY_MEM : Memory::SYSTEM_MEM;
+
   if (read_only_) {
     auto memkind = Memory::Kind::NO_MEMKIND;
     return AccessorRO<T, DIM>(future_, memkind);
@@ -187,8 +193,12 @@ AccessorRO<T, DIM> FutureWrapper::read_accessor(const Rect<DIM>& bounds) const
 #ifdef DEBUG_LEGATE
   assert(sizeof(T) == field_size_);
 #endif
+  // Generated tasks might access future data on the host before launching
+  // tasks. In this case, we need to make sure that future data is actually
+  // addressable on the host.
+  auto proc = Processor::get_executing_processor();
+  auto memkind = (proc.kind() == Processor::TOC_PROC) ? Memory::Z_COPY_MEM : Memory::SYSTEM_MEM;
   if (read_only_) {
-    auto memkind = Memory::Kind::NO_MEMKIND;
     return AccessorRO<T, DIM>(future_, bounds, memkind);
   } else
     return AccessorRO<T, DIM>(buffer_, bounds);

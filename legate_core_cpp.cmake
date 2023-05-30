@@ -237,7 +237,8 @@ endif()
 if(Legion_USE_CUDA)
   list(APPEND legate_core_SOURCES
     src/core/comm/comm_nccl.cu
-    src/core/cuda/stream_pool.cu)
+    src/core/cuda/stream_pool.cu
+    src/core/runtime/mlir_cuda_runtime.cc)
 endif()
 
 add_library(legate_core ${legate_core_SOURCES})

@@ -109,7 +109,7 @@ class MLIRModule {
     // TODO (rohany): This is not the final view of what this function
     //  may look like, but it's something to keep pushing the protoype
     //  forward.
-    void lowerToLLVMDialect(MLIRRuntime* runtime);
+    void lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code);
     void dump(MLIRRuntime* runtime);
 
     // TODO (rohany): Comment...
@@ -133,7 +133,7 @@ class MLIRModule {
     // TODO (rohany): Run a couple passes on this module. In the future this
     //  will be opt in by different libraries, but for now we'll just have
     //  a couple pre-done passes.
-    void optimize(MLIRRuntime* runtime);
+    void optimize(MLIRRuntime* runtime, LegateVariantCode code);
 
     uintptr_t jitToLLVM(MLIRRuntime* runtime);
   private:
@@ -162,7 +162,6 @@ public:
 // TODO (rohany): Comment...
 class MLIRTaskBodyGenerator {
  public:
-   // TODO (rohany): Have to figure out what parameters this will take in...
    virtual std::unique_ptr<MLIRModule> generate_body(
      MLIRRuntime* runtime,
      const std::string& kernelName,
@@ -179,10 +178,7 @@ class MLIRTask {
 public:
   // register_variant (possibly renamed) is used to register a particular
   // task variant of the MLIR task
-  static void register_variant(std::string& name, int task_id);
-
-  // static void cpu_variant(legate::TaskContext& context);
-  // TODO (rohany): Add the other task variants once this starts to work.
+  static void register_variant(std::string& name, int task_id, LegateVariantCode code);
 public:
   static void body(legate::TaskContext& context);
 };

@@ -16,8 +16,9 @@
 
 #include "core/runtime/mlir.h"
 #include "core/data/store.h"
-#include "core/utilities/dispatch.h"
 #include "core/task/task.h"
+#include "core/utilities/dispatch.h"
+#include "core/utilities/nvtx_help.h"
 
 #include "legion.h"
 
@@ -40,12 +41,17 @@
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
 #include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/SCFToGPU/SCFToGPU.h"
+#include "mlir/Conversion/SCFToGPU/SCFToGPUPass.h"
 #include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
@@ -53,6 +59,9 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/GPU/Transforms/Passes.h"
+#include "mlir/Dialect/LLVMIR/Transforms/OptimizeForNVVM.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/Pass/PassManager.h"
@@ -65,7 +74,17 @@
 
 #include <iostream>
 
+#ifdef LEGATE_USE_CUDA
+#define _MLIR_NVTX_RANGE(s) nvtx::Range auto_range(s);
+#else
+#define _MLIR_NVTX_RANGE(s)
+#endif
+
 namespace legate {
+
+// TODO (rohany): Comment...
+extern void mlir_cuda_runtime_api_force_linkage(void);
+
 
 static std::optional<llvm::OptimizationLevel> mapToLevel(unsigned optLevel,
                                                    unsigned sizeLevel) {
@@ -332,15 +351,16 @@ MLIRModule::MLIRModule(
   const std::vector<CompileTimeStoreDescriptor>& reducs
   ) : module_(std::move(module)), kernelName_(kernelName), inputs_(inputs), outputs_(outputs), reducs_(reducs) {}
 
-void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
+void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code) {
+  _MLIR_NVTX_RANGE("lowerToLLVM")
 
-  // TODO (rohany): Also need to run some explicit passes here?
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
 
-  // TODO (rohany): This is a lowering pipeline for single-threaded CPU vector operations.
-  {
-    // TODO (rohany): This should be backend specific?
+  // TODO (rohany): Eventually, libraries will be able to register custom lowering
+  //  hooks into these places as well. It's unclear how the ordering will work there
+  //  though...
+  if (code == LegateVariantCode::LEGATE_CPU_VARIANT) {
     mlir::ConvertVectorToLLVMPassOptions opts{};
     opts.x86Vector = true;
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
@@ -353,59 +373,69 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime) {
     pm.addPass(mlir::createConvertMathToLLVMPass());
     pm.addPass(mlir::createConvertMathToLibmPass());
     // pm.addPass(mlir::createConvertVectorToLLVMPass(opts));
-    // TODO (rohany): Add in math / complex to libm passes?
     pm.addPass(mlir::createConvertFuncToLLVMPass());
     pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+  } else if (code == LegateVariantCode::LEGATE_OMP_VARIANT) {
+#ifdef LEGATE_USE_OPENMP
+    // TODO (rohany): I need to get this to work with vectorization too.
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
+    pm.addPass(mlir::createConvertSCFToOpenMPPass());
+    pm.addPass(mlir::createConvertOpenMPToLLVMPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createExpandStridedMetadataPass());
+    pm.addPass(mlir::createConvertMathToLLVMPass());
+    pm.addPass(mlir::createConvertMathToLibmPass());
+    pm.addPass(mlir::createConvertFuncToLLVMPass());
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+#else
+    assert(false);
+#endif
+  } else if (code == LegateVariantCode::LEGATE_GPU_VARIANT) {
+#ifdef LEGATE_USE_CUDA
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    // TODO (rohany): Not sure how to generalize this blocking...
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopTilingPass({256}));
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createSCFForLoopCanonicalizationPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuMapParallelLoopsPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopToGpuPass());
+    pm.addPass(mlir::createConvertSCFToCFPass());
+    // We have to do lower-affine again because of the re-introduction
+    // of affine operations by some of these mapping passes to GPU.
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    pm.addPass(mlir::createGpuKernelOutliningPass());
+    pm.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createLowerGpuOpsToNVVMOpsPass());
+    pm.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertNVGPUToNVVMPass());
+    pm.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::NVVM::createOptimizeForTargetPass());
+    pm.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createGpuSerializeToCubinPass("nvptx64-nvidia-cuda", "sm_60", "+ptx60"));
+    pm.addPass(mlir::createGpuToLLVMConversionPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createExpandStridedMetadataPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
+    pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+    pm.addPass(mlir::createConvertMathToLLVMPass());
+    pm.addPass(mlir::createConvertMathToLibmPass());
+    // pm.addPass(mlir::createConvertVectorToLLVMPass(opts));
+    pm.addPass(mlir::createConvertFuncToLLVMPass());
+    pm.addPass(mlir::createConvertIndexToLLVMPass());
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+#else
+    assert(false);
+#endif
+  } else {
+    assert(false);
   }
 
-  // TODO (rohany): This is a lowering pipeline for OpenMP operations.
-  // TODO (rohany): I need to get this to work with vectorization too.
-  // {
-  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
-  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
-  //   pm.addPass(mlir::createConvertSCFToOpenMPPass());
-  //   pm.addPass(mlir::createConvertOpenMPToLLVMPass());
-  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createExpandStridedMetadataPass());
-  //   pm.addPass(mlir::createConvertMathToLLVMPass());
-  //   pm.addPass(mlir::createConvertMathToLibmPass());
-  //   pm.addPass(mlir::createConvertFuncToLLVMPass());
-  //   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-  // }
+  // TODO (rohany): Make this configurable to a log file ... 
+  // pm.enableIRPrinting();
 
   if (mlir::failed(pm.run(this->module_.get()))) {
     std::cout << "Failed passes in lower to LLVM" << std::endl;
     runtime->dumpMLIR(this->module_.get());
     assert(false);
   }
-
-
-
-  // TODO (rohany): Eventually, this will need to accept input from individual
-  //  libraries about how to lower things.
-  // mlir::LLVMConversionTarget convTarget(*ctx);
-  // convTarget.addLegalOp<mlir::ModuleOp>();
-  // mlir::LLVMTypeConverter typeConverter(ctx);
-  // mlir::RewritePatternSet patterns(ctx);
-  // mlir::populateAffineToStdConversionPatterns(patterns);
-  // mlir::populateSCFToControlFlowConversionPatterns(patterns);
-  // mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::populateVectorToLLVMConversionPatterns(typeConverter, patterns);
-  // // mlir::populateOpenMPToLLVMConversionPatterns(typeConverter, patterns);
-  // mlir::FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-  // if (mlir::failed(mlir::applyFullConversion(this->module_.get(), convTarget, frozenPatterns))) {
-  //   std::cout << "Failed LLVM Conversion of this module: " << std::endl;
-  //   runtime->dumpMLIR(this->module_.get());
-  //   assert(false);
-  // }
-  // std::cout << "After LLVM Conversion: " << std::endl;
-  // runtime->dumpMLIR(this->module_.get());
 }
 
 uintptr_t MLIRModule::jitToLLVM(MLIRRuntime* runtime) {
+  _MLIR_NVTX_RANGE("jitToLLVM")
   // Now, add the module to the JIT, invoke it, and return a function pointer to the generated code.
   std::unique_ptr<llvm::LLVMContext> llvmContext = std::make_unique<llvm::LLVMContext>();
   auto llvmModule = mlir::translateModuleToLLVMIR(this->module_.get(), *llvmContext, this->kernelName_);
@@ -476,6 +506,8 @@ std::unique_ptr<MLIRModule> MLIRModule::fuseModules(
   const std::vector<CompileTimeStoreDescriptor>& reducs,
   const std::map<int64_t, int32_t>& storeIDToIndexMapping
 ) {
+  _MLIR_NVTX_RANGE("fuseModules")
+
   auto ctx = runtime->getContext().get();
 
   mlir::OpBuilder builder(ctx);
@@ -548,6 +580,7 @@ void MLIRModule::promoteTemporaryStores(
   const std::vector<int32_t>& temporaryStoreOrdinals,
   const std::vector<int32_t>& resolutionOrdinalMapping
 ) {
+  _MLIR_NVTX_RANGE("promoteTemps")
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
   mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
@@ -588,6 +621,7 @@ void MLIRModule::escalateIntermediateStorePrivilege(
   const std::vector<int32_t>& intermediateStoreOrdinals,
   const std::vector<int32_t>& ordinalMapping
 ) {
+  _MLIR_NVTX_RANGE("escalateIntermediates")
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
   mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
@@ -610,48 +644,43 @@ void MLIRModule::escalateIntermediateStorePrivilege(
   this->inputs_ = newInputs;
 }
 
-void MLIRModule::optimize(MLIRRuntime* runtime) {
+void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
+  _MLIR_NVTX_RANGE("optimize")
   auto ctx = runtime->getContext().get();
-  // TODO (rohany): Update these to just use addNestedPass<>.
+
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
-  {
-    mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
-    funcsPM.addPass(mlir::createCSEPass());
-    funcsPM.addPass(mlir::createLoopFusionPass(0, 0, true, mlir::FusionMode::Greedy));
-    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
-    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
-  }
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createCSEPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopFusionPass(0, 0, true, mlir::FusionMode::Greedy));
+  // TODO (rohany): Investigate how many of these are needed...
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
 
   // TODO (rohany): Eventually move this out of the "optimize" function.
+  // TODO (rohany): Why did I write this? Maybe it was because this is a correctness
+  //  thing that the core is doing to normalize memrefs, not an optimization thing.
   pm.addPass(mlir::memref::createNormalizeMemRefsPass());
-  {
-    mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
-    funcsPM.addPass(std::make_unique<MemrefDimensionAccessNormalizingPass>());
-    funcsPM.addPass(mlir::createAffineLoopInvariantCodeMotionPass());
-    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
-    funcsPM.addPass(mlir::createAffineScalarReplacementPass());
+
+  pm.addNestedPass<mlir::func::FuncOp>(std::make_unique<MemrefDimensionAccessNormalizingPass>());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineLoopInvariantCodeMotionPass());
+  // TODO (rohany): Investigate how many of these are needed...
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
+
+  // TODO (rohany): Until I can get vectorization and parallelization to work, I'm
+  //  going to separate this out into a target-specific optimization.
+  if (code == LegateVariantCode::LEGATE_CPU_VARIANT) {
+    // TODO (rohany): Get vector size from CMake.
     std::vector<int64_t> vectorSizes(1, 4);
     mlir::AffineVectorizeOptions options;
     options.vectorSizes = vectorSizes;
-    funcsPM.addPass(mlir::createAffineVectorize(options));
-    // funcsPM.addPass(mlir::createLoopUnrollPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineVectorize(options));
+  } else {
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineParallelizePass());
   }
 
-  // Passes for targeting OpenMP processors.
-  // TODO (rohany): Can't use this in conjunction with the vectorization pass unfortunately.
-  // {
-  //   pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineParallelizePass());
-  // }
-
+  // Some of the other passes can introduce some extra IR that is easy to
+  // remove with some CSE.
   pm.addPass(mlir::createCSEPass());
-
-  // {
-  //   mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
-  //   mlir::VectorTransferToSCFOptions options;
-  //   funcsPM.addPass(mlir::createConvertVectorToSCFPass(options));
-  // }
-
-  // pm.enableIRPrinting();
 
   if (mlir::failed(pm.run(this->module_.get()))) {
     assert(false);
@@ -670,27 +699,37 @@ CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(
 ) : ndim(ndim), typ(typ), id(id), transform(transform) {}
 
 /* static */
-void MLIRTask::register_variant(std::string& name, int task_id) {
+void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCode code) {
   auto runtime = Legion::Runtime::get_runtime();
   runtime->attach_name(task_id, name.c_str(), false /* mutable */, true /* local_only */);
-  // TODO (rohany): Just register the CPU variant for now.
+
+  // Register only the variant that we were requested to.
+  const char* varName = nullptr;
+  auto procKind = Legion::Processor::Kind::NO_KIND;
+  switch (code) {
+    case LegateVariantCode::LEGATE_CPU_VARIANT: {
+      varName = "CPU";
+      procKind = Legion::Processor::Kind::LOC_PROC;
+      break;
+    }
+    case LegateVariantCode::LEGATE_OMP_VARIANT: {
+      varName = "OMP";
+      procKind = Legion::Processor::Kind::OMP_PROC;
+      break;
+    }
+    case LegateVariantCode::LEGATE_GPU_VARIANT: {
+      varName = "GPU";
+      procKind = Legion::Processor::Kind::TOC_PROC;
+      break;
+    }
+  };
   {
-    Legion::TaskVariantRegistrar registrar(task_id, false /* global */, "CPU");
-    registrar.add_constraint(Legion::ProcessorConstraint(Legion::Processor::Kind::LOC_PROC));
+    Legion::TaskVariantRegistrar registrar(task_id, false /* global */, varName);
+    registrar.add_constraint(Legion::ProcessorConstraint(procKind));
     registrar.set_leaf();
     constexpr auto wrapper = detail::legate_task_wrapper<MLIRTask::body>;
-    runtime->register_task_variant(registrar, Legion::CodeDescriptor(wrapper), nullptr, 0, LEGATE_MAX_SIZE_SCALAR_RETURN, LegateVariantCode::LEGATE_CPU_VARIANT);
+    runtime->register_task_variant(registrar, Legion::CodeDescriptor(wrapper), nullptr, 0, LEGATE_MAX_SIZE_SCALAR_RETURN, code);
   }
-
-  // TODO (rohany): Control which processor we do the registration for.
-  // {
-  //   Legion::TaskVariantRegistrar registrar(task_id, false /* global */, "OMP");
-  //   registrar.add_constraint(Legion::ProcessorConstraint(Legion::Processor::Kind::OMP_PROC));
-  //   registrar.set_leaf();
-  //   constexpr auto wrapper = detail::legate_task_wrapper<MLIRTask::body>;
-  //   runtime->register_task_variant(registrar, Legion::CodeDescriptor(wrapper), nullptr, 0, LEGATE_MAX_SIZE_SCALAR_RETURN, LegateVariantCode::LEGATE_OMP_VARIANT);
-  // }
-
 }
 
 template<typename ACC, typename T, int N>

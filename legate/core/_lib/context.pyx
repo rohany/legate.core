@@ -100,12 +100,14 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
 
     cdef cppclass MLIRTask:
         @staticmethod
-        void register_variant(string, int)
+        void register_variant(string, int, legate_core_variant_t)
 
     cdef cppclass MLIRModule:
-        void lowerToLLVMDialect(MLIRRuntime*)
-        void dump(MLIRRuntime*)
+        void optimize(MLIRRuntime*, legate_core_variant_t)
+        void lowerToLLVMDialect(MLIRRuntime*, legate_core_variant_t)
         uintptr_t jitToLLVM(MLIRRuntime*)
+
+        void dump(MLIRRuntime*)
         @staticmethod
         unique_ptr[MLIRModule] fuseModules(
           MLIRRuntime*,
@@ -126,7 +128,6 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
           const vector[int32_t]&,
           const vector[int32_t]&
         )
-        void optimize(MLIRRuntime*)
 
     ctypedef MLIRModule* MLIRModulePtr
 
@@ -233,9 +234,13 @@ cdef class PyMLIRModule:
         cdef unique_ptr[MLIRModule] module = gen.get().generate_body(runtime, kernelName.encode(), inputs, outputs, reducs, buffer, buflen)
         return PyMLIRModule.from_unique_ptr(move(module))
 
-    def lowerToLLVMDialect(self):
+    def lowerToLLVMDialect(self, int variantCode):
         runtime = Runtime.get_runtime().getMLIRRuntime()
-        self._module.get().lowerToLLVMDialect(runtime)
+        self._module.get().lowerToLLVMDialect(runtime, cython.cast(legate_core_variant_t, variantCode))
+
+    def optimize(self, int variantCode) -> None:
+        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
+        self._module.get().optimize(runtime, cython.cast(legate_core_variant_t, variantCode))
 
     def dump(self):
         runtime = Runtime.get_runtime().getMLIRRuntime()
@@ -318,15 +323,11 @@ cdef class PyMLIRModule:
         cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
         self._module.get().escalateIntermediateStorePrivilege(runtime, intermediate_store_ordinals_, ordinal_mapping_)
 
-    def optimize(self) -> None:
-        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
-        self._module.get().optimize(runtime)
-
 
 cdef class PyMLIRTask:
     @staticmethod
-    def register_variant(str name, int id):
-        MLIRTask.register_variant(name.encode(), id)
+    def register_variant(str name, int id, int variantCode):
+        MLIRTask.register_variant(name.encode(), id, cython.cast(legate_core_variant_t, variantCode))
 
 
 cdef class PyMLIRTaskBodyGenerator:
