@@ -27,6 +27,7 @@ struct ResourceConfig {
    * @brief Maximum number of tasks that the library can register
    */
   int64_t max_tasks{1024};
+  int64_t max_preregistered_task_id{1024};
   /**
    * @brief Maximum number of custom reduction operators that the library can register
    */

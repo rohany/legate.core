@@ -171,10 +171,10 @@ class Context:
         for which the task has no variant
         """
         # TODO (rohany): For now, assume that tasks that are generated dynamically
-        # TODO (rohany): What's going on here?
         if task_id >= self._cpp_context.get_max_preregistered_task_id():
-            assert False
-            return
+            # TODO (rohany): We'll want to eventually send over the machine
+            #  that we've constructed from the tasks we're fusing together.
+            return self._runtime.machine
         task_info = self._cpp_context.find_task(task_id)
         if not task_info.valid:
             raise ValueError(
@@ -340,7 +340,6 @@ class Context:
         optimize_scalar: bool = False,
         ndim: Optional[int] = None,
     ) -> Store:
-        dtype = self.type_system[ty]
         return self._runtime.create_store(
             dtype,
             shape=shape,

@@ -135,7 +135,7 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
         CompileTimeStoreDescriptor()
         CompileTimeStoreDescriptor(int32_t, legate_core_type_code_t, int64_t, shared_ptr[TransformStack])
         int32_t ndim
-        legate_core_type_code_t typ
+        legate_core_type_code_t get_type_code()
         int64_t id
 
 
@@ -176,7 +176,7 @@ cdef class PyCompileTimeStoreDescriptor:
         self.desc = CompileTimeStoreDescriptor(ndim, typ, id, stack._stack)
 
     def __str__(self):
-        return f"CompileTimeStoreDescriptor({self.desc.ndim}, {self.desc.typ}, {self.desc.id})"
+        return f"CompileTimeStoreDescriptor({self.desc.ndim}, {self.typ}, {self.desc.id})"
 
     def __repr__(self):
         return self.__str__()
@@ -187,7 +187,7 @@ cdef class PyCompileTimeStoreDescriptor:
 
     @property
     def typ(self) -> legate_core_type_code_t:
-        return self.desc.typ
+        return self.desc.get_type_code()
 
     @property
     def id(self) -> int:
@@ -200,13 +200,14 @@ cdef class PyCompileTimeStoreDescriptor:
     # excluded from the hash and equality functions.
 
     def __hash__(self) -> int:
-        return hash((self.desc.ndim, self.desc.typ))
+        return hash((self.desc.ndim, self.typ))
 
     def __eq__(self, other) -> bool:
+        # TODO (rohany): Also check equality of the transform stacks?
         return (
             isinstance(other, PyCompileTimeStoreDescriptor)
             and self.desc.ndim == other.ndim
-            and self.desc.typ == other.typ
+            and self.typ == other.typ
         )
 
 

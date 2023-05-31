@@ -1480,7 +1480,7 @@ class Runtime:
                     # TODO (rohany): Pack the arguments into a buffer for the tasks.
                     builder = BufferBuilder()
                     for arg, dtype in op._scalar_args:
-                        scalar = ScalarArg(self._core_context.type_system, arg, dtype)
+                        scalar = ScalarArg(arg, dtype)
                         scalar.pack(builder)
                     buffer = bytes(builder.get_string())
                     bufSize = builder.get_size()
@@ -1811,7 +1811,7 @@ class Runtime:
                     # about the stores other than their data types and number of dimensions.
                     builder = BufferBuilder()
                     for arg, dtype in op._scalar_args:
-                        scalar = ScalarArg(self._core_context.type_system, arg, dtype)
+                        scalar = ScalarArg(arg, dtype)
                         scalar.pack(builder)
                     buffer = bytes(builder.get_string())
                     bufSize = builder.get_size()

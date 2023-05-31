@@ -168,6 +168,8 @@ Machine::Machine(Legion::Machine legion_machine)
         omps_.push_back(proc);
         continue;
       }
+      default:
+        continue;
     }
   }
 

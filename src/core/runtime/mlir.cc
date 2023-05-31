@@ -689,14 +689,14 @@ void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
 
 MLIRTaskBodyGenerator::~MLIRTaskBodyGenerator() {}
 
-CompileTimeStoreDescriptor::CompileTimeStoreDescriptor() : ndim(0), typ(LegateTypeCode::MAX_TYPE_NUMBER), id(0), transform(nullptr) {}
+CompileTimeStoreDescriptor::CompileTimeStoreDescriptor() : ndim(0), typ(Type::Code::INVALID), id(0), transform(nullptr) {}
 
 CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(
   int32_t ndim,
-  LegateTypeCode typ,
+  legate_core_type_code_t typ,
   int64_t id,
   std::shared_ptr<TransformStack> transform
-) : ndim(ndim), typ(typ), id(id), transform(transform) {}
+) : ndim(ndim), typ(static_cast<Type::Code>(typ)), id(id), transform(transform) {}
 
 /* static */
 void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCode code) {
@@ -720,6 +720,10 @@ void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCod
     case LegateVariantCode::LEGATE_GPU_VARIANT: {
       varName = "GPU";
       procKind = Legion::Processor::Kind::TOC_PROC;
+      break;
+    }
+    default: {
+      assert(false);
       break;
     }
   };
@@ -748,7 +752,7 @@ StridedMemRefType<T, N> accessorToMemRef(ACC acc, Legion::Rect<N> bounds) {
 }
 
 struct AccessorToMemrefDescAlloc {
-  template<LegateTypeCode CODE, int DIM>
+  template<Type::Code CODE, int DIM>
   void* operator()(const Store& store, bool read) {
     using T = legate_type_of<CODE>;
     StridedMemRefType<T, DIM> memref;
@@ -766,7 +770,7 @@ struct AccessorToMemrefDescAlloc {
 };
 
 struct FutureToMemrefDescAlloc {
-  template<LegateTypeCode CODE>
+  template<Type::Code CODE>
   void* operator()(const Store& store, bool read) {
     using T = legate_type_of<CODE>;
     StridedMemRefType<T, 1> memref;
@@ -865,53 +869,53 @@ void MLIRTask::body(TaskContext& context) {
   }
 }
 
-mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, LegateTypeCode typ) {
+mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, Type::Code typ) {
   switch (typ) {
-    case LegateTypeCode::BOOL_LT: {
+    case Type::Code::BOOL: {
       return mlir::IntegerType::get(ctx, 1, mlir::IntegerType::SignednessSemantics::Signless);
     }
-    case LegateTypeCode::INT8_LT: {
+    case Type::Code::INT8: {
       return mlir::IntegerType::get(ctx, 8, mlir::IntegerType::SignednessSemantics::Signed);
     }
-    case LegateTypeCode::INT16_LT: {
+    case Type::Code::INT16: {
       return mlir::IntegerType::get(ctx, 16, mlir::IntegerType::SignednessSemantics::Signed);
     }
-    case LegateTypeCode::INT32_LT: {
+    case Type::Code::INT32: {
       return mlir::IntegerType::get(ctx, 32, mlir::IntegerType::SignednessSemantics::Signed);
     }
-    case LegateTypeCode::INT64_LT: {
+    case Type::Code::INT64: {
       return mlir::IntegerType::get(ctx, 64, mlir::IntegerType::SignednessSemantics::Signed);
     }
-    case LegateTypeCode::UINT8_LT: {
+    case Type::Code::UINT8: {
       return mlir::IntegerType::get(ctx, 8, mlir::IntegerType::SignednessSemantics::Unsigned);
     }
-    case LegateTypeCode::UINT16_LT: {
+    case Type::Code::UINT16: {
       return mlir::IntegerType::get(ctx, 16, mlir::IntegerType::SignednessSemantics::Unsigned);
     }
-    case LegateTypeCode::UINT32_LT: {
+    case Type::Code::UINT32: {
       return mlir::IntegerType::get(ctx, 32, mlir::IntegerType::SignednessSemantics::Unsigned);
     }
-    case LegateTypeCode::UINT64_LT: {
+    case Type::Code::UINT64: {
       return mlir::IntegerType::get(ctx, 64, mlir::IntegerType::SignednessSemantics::Unsigned);
     }
-    case LegateTypeCode::HALF_LT: {
+    case Type::Code::FLOAT16: {
       return mlir::Float16Type::get(ctx);
     }
-    case LegateTypeCode::FLOAT_LT: {
+    case Type::Code::FLOAT32: {
       return mlir::Float32Type::get(ctx);
     }
-    case LegateTypeCode::DOUBLE_LT: {
+    case Type::Code::FLOAT64: {
       return mlir::Float64Type::get(ctx);
     }
-    case LegateTypeCode::COMPLEX64_LT: {
+    case Type::Code::COMPLEX64: {
       // TODO (rohany): Check this...
       return mlir::ComplexType::get(mlir::Float32Type::get(ctx));
     }
-    case LegateTypeCode::COMPLEX128_LT: {
+    case Type::Code::COMPLEX128: {
       // TODO (rohany): Check this...
       return mlir::ComplexType::get(mlir::Float64Type::get(ctx));
     }
-    case LegateTypeCode::STRING_LT: {
+    case Type::Code::STRING: {
       assert(false);
       return mlir::Float16Type::get(ctx);
     }

@@ -20,7 +20,6 @@
 
 #include <memory>
 
-#include "core/runtime/context.h"
 #include "core/runtime/mlir_decls.h"
 #include "core/runtime/resource.h"
 #include "core/task/exception.h"

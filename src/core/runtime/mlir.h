@@ -152,9 +152,10 @@ typedef MLIRModule* MLIRModulePtr;
 class CompileTimeStoreDescriptor {
 public:
   CompileTimeStoreDescriptor();
-  CompileTimeStoreDescriptor(int32_t ndim, LegateTypeCode typ, int64_t id, std::shared_ptr<TransformStack>);
+  CompileTimeStoreDescriptor(int32_t ndim, legate_core_type_code_t typ, int64_t id, std::shared_ptr<TransformStack>);
+  legate_core_type_code_t get_type_code() { return static_cast<legate_core_type_code_t>(typ); }
   int32_t ndim;
-  LegateTypeCode typ;
+  Type::Code typ;
   int64_t id;
   std::shared_ptr<TransformStack> transform;
 };
@@ -200,7 +201,7 @@ public:
 // Utility functions for developing MLIR task bodies.
 // TODO (rohany): In the future, maybe these go to a different file.
 
-mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, LegateTypeCode typ);
+mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, Type::Code typ);
 mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreDescriptor& desc);
 std::pair<llvm::SmallVector<mlir::Value, 4>, llvm::SmallVector<mlir::Value, 4>> loopBoundsFromVar(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value var, int32_t ndim);
 
