@@ -19,6 +19,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Tuple,
 )
 
 from . import types as ty
@@ -155,8 +156,10 @@ class FusedTaskConstructionDescriptor:
             inputs: List[Store],
             outputs: List[Store],
             reducs: List[Store],
+            taskid: int,
             funcptr: int,
     ):
+        self.taskid = taskid
         self.funcptr = funcptr
         store_to_orig_pos = {}
 
@@ -176,6 +179,14 @@ class FusedTaskConstructionDescriptor:
             self.outputs.append(store_to_orig_pos[store._unique_id])
         for store in reducs:
             self.reducs.append(store_to_orig_pos[store._unique_id])
+
+    def build_task(self, ops: List[Task], strategies: List[Strategy]) -> Tuple[Task, Strategy]:
+        # TODO (rohany): Worry about when these ops come from different libraries.
+        newTask = ops[0].context.create_auto_task(self.taskid)
+        self.add_stores_to_task(newTask, ops)
+        self.add_impl_to_task(newTask)
+        newStrat = self.build_new_strategy(newTask, ops, strategies)
+        return newTask, newStrat
 
     def add_impl_to_task(self, fused: AutoTask):
         fused.add_scalar_arg(self.funcptr, ty.uint64)

@@ -1733,17 +1733,13 @@ class Runtime:
 
                     # fused.dump()
                     funcptr = fused.jitToLLVM()
-                    fusionDesc = FusedTaskConstructionDescriptor(ops, new_inputs, new_outputs, new_reducs, funcptr)
+
+                    local_task_id = ops[0].context.get_fresh_local_task_id()
+                    PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id), target_variant)
+                    fusionDesc = FusedTaskConstructionDescriptor(ops, new_inputs, new_outputs, new_reducs, local_task_id, funcptr)
                     self._fused_task_window_cache[task_window_desc] = fusionDesc
 
-                # TODO (rohany): Worry about when these ops come from different libraries.
-                local_task_id = ops[0].context.get_fresh_local_task_id()
-                PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id), target_variant)
-                newTask = ops[0].context.create_auto_task(local_task_id)
-
-                fusionDesc.add_stores_to_task(newTask, ops)
-                fusionDesc.add_impl_to_task(newTask)
-                newStrat = fusionDesc.build_new_strategy(newTask, ops, strategies)
+                newTask, newStrat = fusionDesc.build_task(ops, strategies)
 
                 ops = [newTask]
                 strategies = [newStrat]
