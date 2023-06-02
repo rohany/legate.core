@@ -162,9 +162,11 @@ class FusedTaskConstructionDescriptor:
 
         for opidx, op in enumerate(ops):
             for storeidx, store in enumerate(op.inputs):
-                store_to_orig_pos[store._unique_id] = (opidx, storeidx)
+                if store._unique_id not in store_to_orig_pos:
+                    store_to_orig_pos[store._unique_id] = (opidx, storeidx)
             for storeidx, store in enumerate(op.outputs):
-                store_to_orig_pos[store._unique_id] = (opidx, storeidx)
+                if store._unique_id not in store_to_orig_pos:
+                    store_to_orig_pos[store._unique_id] = (opidx, storeidx)
             # TODO (rohany): Handle reductions.
 
         self.inputs, self.outputs, self.reducs = [], [], []
