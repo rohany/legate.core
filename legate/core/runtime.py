@@ -1405,6 +1405,16 @@ class Runtime:
             with op.target_machine:
                 strategies.append(partitioner.partition_stores())
 
+            # For now, we only set key partitions once tasks have launched.
+            # However, we want to consider temporaries that we have in the middle
+            # of a big window to eventually have key partitions based on how
+            # we partition them, so set those after we finish the first partitioning pass.
+            if settings.kernel_fusion():
+                if isinstance(op, AutoTask):
+                    for store, sym in zip(op.outputs, op._output_parts):
+                        part = strategies[-1].get_partition(sym)
+                        store.set_key_partition(part)
+
         # TODO (rohany): I think it's time to try and write some kind of fusion
         #  here. I think the goal for now is to first get the whole pipeline
         #  working on the MLIR/LLVM side, so I think the prudent way forward

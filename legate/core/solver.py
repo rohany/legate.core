@@ -592,6 +592,11 @@ class Partitioner:
             return (
                 -store.comm_volume(),
                 not store.has_key_partition(all_restrictions[unknown]),
+                # This is a temporary hack to help with stencil codes, where we
+                # prefer the key partitions of temporary stores. This helps to
+                # keep temporary stores in place and move some of the input data,
+                # which is actually the right choice for stencil codes.
+                store.has_external_references(),
             )
 
         result: dict[PartSym, PartitionBase]
