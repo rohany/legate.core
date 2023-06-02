@@ -655,12 +655,14 @@ void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
   pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
 
-  // TODO (rohany): Eventually move this out of the "optimize" function.
-  // TODO (rohany): Why did I write this? Maybe it was because this is a correctness
-  //  thing that the core is doing to normalize memrefs, not an optimization thing.
+  // TODO (rohany): Eventually move this out of the "optimize" function, as it is
+  //  a correctness condition, not an optimization.
+  // The dimension normalizing pass must be run before the actual memref normalizing
+  // pass because the original dimensions of stores may be lost after transform inversion.
+  pm.addNestedPass<mlir::func::FuncOp>(std::make_unique<MemrefDimensionAccessNormalizingPass>());
+
   pm.addPass(mlir::memref::createNormalizeMemRefsPass());
 
-  pm.addNestedPass<mlir::func::FuncOp>(std::make_unique<MemrefDimensionAccessNormalizingPass>());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopInvariantCodeMotionPass());
   // TODO (rohany): Investigate how many of these are needed...
   pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
