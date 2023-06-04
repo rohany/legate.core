@@ -22,6 +22,8 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
 
@@ -217,6 +219,39 @@ void MemrefDimensionAccessNormalizingPass::runOnOperation() {
   for (auto it : newArgTypes) { argTypes.push_back(it); }
   auto newFuncType = builder.getFunctionType(argTypes, std::nullopt);
   op.setFunctionType(newFuncType);
+}
+
+GreedyLoopCollapsingPass::GreedyLoopCollapsingPass() {}
+
+void GreedyLoopCollapsingPass::runOnOperation() {
+  // The GreedyLoopCollapsingPass collapses multi-dimensional for loops into a single
+  // loop nest so that it can be scheduled onto GPUs.
+  auto& ctx = this->getContext();
+  mlir::func::FuncOp op = this->getOperation();
+  mlir::OpBuilder builder(&ctx);
+  auto loc = mlir::NameLoc::get(mlir::StringAttr::get(&ctx, "greedyLoopCollapsing"));
+
+  llvm::SmallVector<mlir::scf::ParallelOp, 4> parallelOps;
+  auto& entryBlock = op.getBlocks().front();
+  for (auto& inst : entryBlock) {
+    if (!mlir::isa<mlir::scf::ParallelOp>(inst)) continue;
+    // Go through all parallel for loops in the function, and try to collapse them
+    // into a 1-D loop.
+    auto pfor = mlir::cast<mlir::scf::ParallelOp>(inst);
+    parallelOps.push_back(pfor);
+  }
+  for (auto pfor : parallelOps) {
+    constexpr int maxNestedDim = 3;
+    auto numLoops = pfor.getNumLoops();
+    assert(numLoops <= maxNestedDim);
+    // We don't need to do any collapsing of 1D loops.
+    if (numLoops == 1) continue;
+    std::vector<unsigned> dims;
+    for (int i = 0; i < numLoops; i++) dims.push_back(i);
+    llvm::SmallVector<decltype(dims), 1> ref;
+    ref.push_back(dims);
+    mlir::collapseParallelLoops(pfor, ref);
+  }
 }
 
 void SimpleObjectCache::notifyObjectCompiled(const llvm::Module *m,

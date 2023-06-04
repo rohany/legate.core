@@ -63,6 +63,12 @@ class MemrefDimensionAccessNormalizingPass :
    void runOnOperation() final;
 };
 
+class GreedyLoopCollapsingPass : public mlir::PassWrapper<GreedyLoopCollapsingPass, mlir::OperationPass<mlir::func::FuncOp>> {
+ public:
+  GreedyLoopCollapsingPass();
+  void runOnOperation() final;
+};
+
 // TODO (rohany): ............
 // TODO (rohany): WHY IS THIS HERE>>>>>>>>>>>>>>>>> RTTI NONSENSE
 /// A simple object cache following Lang's LLJITWithObjectCache example.

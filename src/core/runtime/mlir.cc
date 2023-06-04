@@ -393,7 +393,11 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code
   } else if (code == LegateVariantCode::LEGATE_GPU_VARIANT) {
 #ifdef LEGATE_USE_CUDA
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
-    // TODO (rohany): Not sure how to generalize this blocking...
+    // In order to schedule loops of arbitrary dimensions onto GPUs, we first run
+    // the canonicalizer pass, which collects nested for-loops into multi-dimensional
+    // for loops, followed by a loop collapsing pass.
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addNestedPass<mlir::func::FuncOp>(std::make_unique<GreedyLoopCollapsingPass>());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopTilingPass({256}));
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createSCFForLoopCanonicalizationPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuMapParallelLoopsPass());
