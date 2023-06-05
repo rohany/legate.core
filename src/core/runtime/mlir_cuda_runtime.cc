@@ -15,6 +15,8 @@
  */
 
 #include <stdio.h>
+#include <unordered_map>
+#include <mutex>
 
 #include "cuda.h"
 #include "legion.h"
@@ -46,14 +48,31 @@ namespace legate {
 extern "C" {
 
 EXTERNAL_LINKAGE CUmodule mgpuModuleLoad(void* data) {
-  // TODO (rohany): Make a table per processor of maps from pointer
-  //  to module so that we only load modules once. Just to check that
-  //  this is working though, I'm going to start out without it.
-
   // Realm will set the correct cuContext at the entry of the CUDA task,
-  // so we don't need to do anything before loading the module.
+  // so we don't need to do that sort of book-keeping on entry.
+
+  // Construct per-processor CUmodule and lock maps to maintain
+  // loaded modules per-processor. There may be task parallelism
+  // between fused GPU kernels, so we have to protect this table
+  // with a lock.
+  static std::mutex lock_table[LEGION_MAX_NUM_PROCS];
+  static std::unordered_map<void*, CUmodule> module_table[LEGION_MAX_NUM_PROCS];
+  const auto proc = Legion::Processor::get_executing_processor();
+  const auto proc_id = proc.id & (LEGION_MAX_NUM_PROCS - 1);
   CUmodule module = nullptr;
-  CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
+  {
+    std::lock_guard<std::mutex> guard(lock_table[proc_id]);
+    // Probe the table to see if we can find the module. If we don't find
+    // it for the current GPU, then we have to actually make the call.
+    auto it = module_table[proc_id].find(data);
+    if (it == module_table[proc_id].end()) {
+      CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
+      module_table[proc_id][data] = module;
+    } else {
+      module = it->second;
+    }
+  }
+
   return module;
 }
 
