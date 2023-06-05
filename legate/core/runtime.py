@@ -1458,6 +1458,9 @@ class Runtime:
                     check_store_part(input, strategy.get_partition(sym))
                 for output, sym in zip(op.outputs, op._output_parts):
                     check_store_part(output, strategy.get_partition(sym))
+                # All of the target machines used for the operations
+                # must be the same as well.
+                all_eq = all_eq and op.target_machine == ops[0].target_machine
 
             if all_eq:
                 # Now we have to actually generate a fused task body.
