@@ -402,6 +402,8 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createSCFForLoopCanonicalizationPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuMapParallelLoopsPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopToGpuPass());
+    // Lol, the pass is misspelled in LLVM mainline...
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuLauchSinkIndexComputationsPass());
     pm.addPass(mlir::createConvertSCFToCFPass());
     // We have to do lower-affine again because of the re-introduction
     // of affine operations by some of these mapping passes to GPU.
