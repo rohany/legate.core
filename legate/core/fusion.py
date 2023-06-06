@@ -27,12 +27,98 @@ from . import types as ty
 from ._legion.util import BufferBuilder
 
 if TYPE_CHECKING:
-    from .operation import AutoTask, Task
+    from .operation import AutoTask, Task, Operation
+    from .partition import PartitionBase
     from .solver import Strategy
     from .store import Store
 
 # TODO (rohany): I plan on having runtime import this module,
 #  so let's be careful to avoid circular imports.
+
+# FusionConstraint is an abstract class that represents an extendable fusion
+# constraint. Fusion constraints process tasks in a buffer one at a time and
+# communicate whether it is semantically correct to fuse a buffer of tasks.
+# The apply method may maintain internal state while processing task buffers.
+class FusionConstraint:
+    def apply(self, op: Operation, strat: Strategy) -> bool:
+        pass
+
+
+# AutoTaskConstraint checks whether the operation is indeed an AutoTask.
+class AutoTaskConstraint(FusionConstraint):
+    def apply(self, op: Operation, _: Strategy) -> bool:
+        from .operation import AutoTask
+        return isinstance(op, AutoTask)
+
+
+# MLIRVariantConstraint checks that the given task has an MLIR variant.
+class MLIRVariantConstraint(FusionConstraint):
+    def apply(self, op: Operation, _: Strategy) -> bool:
+        tid = op._task_id
+        info = op.context._cpp_context.find_task(tid)
+        assert(info.valid)
+        return info.has_mlir_variant()
+
+
+# MachineConstraint checks that the target machine for all operations in the
+# considered window are the same.
+class MachineConstraint(FusionConstraint):
+    def __init__(self):
+        self._machine = None
+
+    def apply(self, op: Operation, _: Strategy) -> bool:
+        if self._machine is None:
+            self._machine = op.target_machine
+            return True
+        else:
+            return self._machine == op.target_machine
+
+
+# PartitionEquivalenceConstraint checks that each store is used in
+# the same partition (i.e. the same view) across the window. If a store
+# is viewed in multiple different ways, this implies communication, and
+# thus no fusion.
+class PartitionEquivalenceConstraint(FusionConstraint):
+    def __init__(self):
+        self._store_parts = {}
+
+    def apply(self, op: Operation, strat: Strategy) -> bool:
+        # TODO (rohany): Handle reductions.
+        for input, sym in zip(op.inputs, op._input_parts):
+            if not self._check(input, strat.get_partition(sym)):
+                return False
+        for output, sym in zip(op.outputs, op._output_parts):
+            if not self._check(output, strat.get_partition(sym)):
+                return False
+        return True
+
+    def _check(self, store: Store, part: PartitionBase) -> bool:
+        if store not in self._store_parts:
+            self._store_parts[store] = part
+            return True
+        else:
+            return self._store_parts[store] == part
+
+
+# FusionConstraintManager manages a set of user-provided fusion constraints,
+# and controls how much of the task buffer can be fused.
+class FusionConstraintManager:
+    def __init__(self):
+        self._constraints = []
+
+    def register_constraint(self, constraint: FusionConstraint) -> None:
+        self._constraints.append(constraint)
+
+    # compute_fusable_prefix returns how large of a prefix of the input
+    # list of operations may be fused together.
+    def compute_fusable_prefix(self, ops: List[Operation], strategy: List[Strategy]) -> int:
+        for idx, (op, strat) in enumerate(zip(ops, strategy)):
+            for constraint in self._constraints:
+                if not constraint.apply(op, strat):
+                    return idx
+        # If we made it here, the entire buffer is fusable.
+        return len(ops)
+
 
 class TaskWindowDescriptor:
     # Initialize TaskWindowDescriptor with a slice of operation.Task objects.
