@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .partition import PartitionBase
     from .solver import Strategy
     from .store import Store, Storage
+    from ._lib.context import PyMLIRModule  # type: ignore[import]
 
 # TODO (rohany): I plan on having runtime import this module,
 #  so let's be careful to avoid circular imports.
@@ -400,3 +401,47 @@ class FusedTaskConstructionDescriptor:
             new_strat.merge(strat)
         # Remap all of the needed symbols over to the new symbols.
         return new_strat.remap(self.build_part_sym_mapping(fused, ops))
+
+
+# Utility methods to perform components of task and kernel fusion.
+def generate_mlir_modules(ops: List[Operation]) -> List[PyMLIRModule]:
+    from .launcher import ScalarArg
+
+    modules = []
+    for op in ops:
+        tid = op._task_id
+        info = op.context._cpp_context.find_task(tid)
+        gen = info.get_mlir_body_generator()
+        inputs = [s.to_comp_time_store_desc() for s in op.inputs]
+        outputs = [s.to_comp_time_store_desc() for s in op.outputs]
+        reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
+
+        # Pack the arguments into a buffer for the tasks.
+        builder = BufferBuilder()
+        for arg, dtype in op._scalar_args:
+            scalar = ScalarArg(arg, dtype)
+            scalar.pack(builder)
+        buffer = bytes(builder.get_string())
+        bufSize = builder.get_size()
+        # TODO (rohany): Include a cache for these generated kernels.
+        modules.append(gen.generate_body(inputs, outputs, reducs, buffer, bufSize))
+    return modules
+
+
+# The calling convention for fused tasks is to deduplicate and group
+# the inputs, outputs and reductions for the new task.
+def construct_store_calling_convention(ops: List[Operation]) -> Tuple[List[Store], List[Store], List[Store]]:
+    new_inputs, new_outputs, new_reducs = [], [], []
+    dedup_inputs, dedup_outputs, dedup_reducs = set(), set(), set()
+    for op in ops:
+        def dedup_add(l, s, val):
+            if val not in s:
+                s.add(val)
+                l.append(val)
+        for input in op.inputs:
+            dedup_add(new_inputs, dedup_inputs, input)
+        for output in op.outputs:
+            dedup_add(new_outputs, dedup_outputs, output)
+        for reduc, _ in op.reductions:
+            dedup_add(new_reducs, dedup_reducs, reduc)
+    return new_inputs, new_outputs, new_reducs

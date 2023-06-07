@@ -75,6 +75,8 @@ from .fusion import (
     ProducerConsumerViewConstraint,
     SupportedStoreTransformsConstraint,
     AliasingReadWriteViewConstraint,
+    generate_mlir_modules,
+    construct_store_calling_convention,
 )
 from .machine import Machine, ProcessorKind
 from .projection import is_identity_projection, pack_symbolic_projection_repr
@@ -1405,7 +1407,6 @@ class Runtime:
         strategies: List[Strategy],
         pending_ops: List[Operation]
     ) -> Tuple[Operation, Strategy]:
-        from .launcher import ScalarArg
         from ._legion.util import BufferBuilder
         # TODO (rohany): Have to change this to ask for
         #  feedback from the generated tasks, whether they can
@@ -1437,47 +1438,10 @@ class Runtime:
         else:
             # We missed the cache, so do all of the necessary analysis.
             # First construct MLIR modules for each of the task bodies.
-            modules = []
-            for op in ops:
-                tid = op._task_id
-                info = op.context._cpp_context.find_task(tid)
-                gen = info.get_mlir_body_generator()
-                inputs = [s.to_comp_time_store_desc() for s in op.inputs]
-                outputs = [s.to_comp_time_store_desc() for s in op.outputs]
-                reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
+            modules = generate_mlir_modules(ops)
 
-                # Pack the arguments into a buffer for the tasks.
-                builder = BufferBuilder()
-                for arg, dtype in op._scalar_args:
-                    scalar = ScalarArg(arg, dtype)
-                    scalar.pack(builder)
-                buffer = bytes(builder.get_string())
-                bufSize = builder.get_size()
-                modules.append(gen.generate_body(inputs, outputs, reducs, buffer, bufSize))
-
-            # We have to come up with a calling convention here for the fused task.
-            # The simplest thing to do is group all inputs, then outputs, then reductions.
-            # So I'll deduplicate each of the sets of stores, and use that to remap
-            # all of the inputs from each task to the new arguments of the super-task.
-            new_inputs, new_outputs, new_reducs = [], [], []
-            dedup_inputs, dedup_outputs, dedup_reducs = set(), set(), set()
-            first_op_inputs, final_op_outputs = set(), set()
-            for i in range(len(ops)):
-                op = ops[i]
-                def dedup_add(l, s, val):
-                    if val not in s:
-                        s.add(val)
-                        l.append(val)
-                for input in op.inputs:
-                    dedup_add(new_inputs, dedup_inputs, input)
-                    if i == 0:
-                        first_op_inputs.add(input)
-                for output in op.outputs:
-                    dedup_add(new_outputs, dedup_outputs, output)
-                    if i == (len(ops) - 1):
-                        final_op_outputs.add(output)
-                for reduc, _ in op.reductions:
-                    dedup_add(new_reducs, dedup_reducs, reduc)
+            # Gather the stores into a calling convention for the fused task.
+            new_inputs, new_outputs, new_reducs = construct_store_calling_convention(ops)
 
             # We'll order the stores in the calling convention like [inputs, outputs, reductions],
             # so we can construct a mapping from a particular store to an index in this concatenation.
@@ -1489,17 +1453,14 @@ class Runtime:
                 store_id_to_index_mapping[store._unique_id] = index
                 index += 1
 
-            new_input_descs = [s.to_comp_time_store_desc() for s in new_inputs]
-            new_output_descs = [s.to_comp_time_store_desc() for s in new_outputs]
-            new_reduc_descs = [s.to_comp_time_store_desc() for s in new_reducs]
-            # Now construct a new MLIR module that fuses all of the tasks together
+            # Construct a new MLIR module that fuses all of the tasks together
             # into a single body, and uses the constructed mappings to perform
             # the remappings of each argument to the new arguments.
             fused = PyMLIRModule.construct_fused_module(
                 modules,
-                new_input_descs,
-                new_output_descs,
-                new_reduc_descs,
+                [s.to_comp_time_store_desc() for s in new_inputs],
+                [s.to_comp_time_store_desc() for s in new_outputs],
+                [s.to_comp_time_store_desc() for s in new_reducs],
                 store_id_to_index_mapping
             )
 
@@ -1551,11 +1512,8 @@ class Runtime:
             index = 0
             durable_inputs, durable_outputs = [], []
 
-            # TODO (rohany): A generalization of the "not in first_op_inputs" is that
-            #  an input-only store can only be marked as temporary if it is defined (written to)
-            #  by an operation preceding it in the task pipeline.
-            # TODO (rohany): This is just a hack, not sure yet if I need a sliding window
-            #  kind of data structure.
+            # A store can only be temporary if it is written to by at least one operation
+            # in the fuse buffer. Otherwise, where will the initial values come from?
             defined_storages = set()
             for op in ops:
                 for store in op.outputs:
@@ -1579,7 +1537,6 @@ class Runtime:
                         read_pending_storages.add(uid)
                 for output in op.outputs:
                     killed_pending_storages.add(output._storage._unique_id)
-
 
             for store in new_inputs:
                 if not store.has_external_references() and store._storage._unique_id in defined_storages:
@@ -1625,8 +1582,6 @@ class Runtime:
                 resolved_shape_ordinals.append(store_id_to_index_mapping[resolved._unique_id])
 
             fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
-
-            # fused.dump()
 
             ######### Done Temporary Elimination
 
@@ -1702,7 +1657,6 @@ class Runtime:
 
             fused.lowerToLLVMDialect(target_variant)
 
-            # fused.dump()
             funcptr = fused.jitToLLVM()
 
             local_task_id = ops[0].context.get_fresh_local_task_id()
