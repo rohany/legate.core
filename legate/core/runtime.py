@@ -1695,7 +1695,7 @@ class Runtime:
 
             ######### Done standard pass application
 
-            fused.dump()
+            # fused.dump()
 
             # TODO (rohany): At this point, all of the analysis being done to the
             #  task should be finished.
