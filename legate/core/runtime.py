@@ -32,6 +32,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Set,
     Tuple,
     TypeVar,
     Union,
@@ -70,7 +71,10 @@ from .fusion import (
     AutoTaskConstraint,
     MLIRVariantConstraint,
     MachineConstraint,
-    PartitionEquivalenceConstraint
+    PartitionAliasingViewConstraint,
+    ProducerConsumerViewConstraint,
+    SupportedStoreTransformsConstraint,
+    AliasingReadWriteViewConstraint,
 )
 from .machine import Machine, ProcessorKind
 from .projection import is_identity_projection, pack_symbolic_projection_repr
@@ -91,6 +95,7 @@ if TYPE_CHECKING:
     from .operation import Operation
     from .partition import PartitionBase
     from .projection import SymbolicPoint
+    from .solver import Strategy
     from .store import RegionField, Store
 
     ProjSpec = Tuple[int, SymbolicPoint]
@@ -1394,22 +1399,357 @@ class Runtime:
         self._attachment_manager.prune_detachments()
         return op.launch(self.legion_runtime, self.legion_context)
 
-    def _schedule(self, ops: List[Operation]) -> None:
-        from .solver import Partitioner
-        from .operation import AutoTask
+    def _fuse_buffer(
+        self,
+        ops: List[Operation],
+        strategies: List[Strategy],
+        pending_ops: List[Operation]
+    ) -> Tuple[Operation, Strategy]:
         from .launcher import ScalarArg
         from ._legion.util import BufferBuilder
+        # TODO (rohany): Have to change this to ask for
+        #  feedback from the generated tasks, whether they can
+        #  target the same task variants or not etc.
+        target_variant = self.core_task_variant_id
 
-        # TODO: For now we run the partitioner for each operation separately.
-        #       We will eventually want to compute a trace-wide partitioning
-        #       strategy.
+        # Now we have to actually generate a fused task body.
+        # Things that need to be accomplished:
+        # 1) Demotion of temporary stores into local allocations.
+        #    The rules for this need to be thought through more clearly,
+        #    because we have to take into account the partitioning constraint
+        #    being applied to the temporary stores to really make them
+        #    temporary, as well as to figure out what the sizes of those
+        #    local allocations should be, in case they don't get removed.
+        #    TODO (rohany): I think that for now, we can just assume that
+        #     the only constraints being used are tiling and alignment
+        #     constraints, so we can just use the sizes of one of the
+        #     other stores for the size of the local allocations.
+        # 2) The building of a super-task that contains all of the task bodies
+        #    of the original tasks, but has also eliminated redundant stores
+        #    from the inputs of each task, so that the super task takes in
+        #    a unique set of inputs.
+        # 3) The application of MLIR optimization passes on the generated
+        #    super-task that actually optimize the resulting code.
 
-        strategies = []
-        for op in ops:
+        task_window_desc = TaskWindowDescriptor(ops)
+        if task_window_desc in self._fused_task_window_cache:
+            fusionDesc = self._fused_task_window_cache[task_window_desc]
+        else:
+            # We missed the cache, so do all of the necessary analysis.
+            # First construct MLIR modules for each of the task bodies.
+            modules = []
+            for op in ops:
+                tid = op._task_id
+                info = op.context._cpp_context.find_task(tid)
+                gen = info.get_mlir_body_generator()
+                inputs = [s.to_comp_time_store_desc() for s in op.inputs]
+                outputs = [s.to_comp_time_store_desc() for s in op.outputs]
+                reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
+
+                # Pack the arguments into a buffer for the tasks.
+                builder = BufferBuilder()
+                for arg, dtype in op._scalar_args:
+                    scalar = ScalarArg(arg, dtype)
+                    scalar.pack(builder)
+                buffer = bytes(builder.get_string())
+                bufSize = builder.get_size()
+                modules.append(gen.generate_body(inputs, outputs, reducs, buffer, bufSize))
+
+            # We have to come up with a calling convention here for the fused task.
+            # The simplest thing to do is group all inputs, then outputs, then reductions.
+            # So I'll deduplicate each of the sets of stores, and use that to remap
+            # all of the inputs from each task to the new arguments of the super-task.
+            new_inputs, new_outputs, new_reducs = [], [], []
+            dedup_inputs, dedup_outputs, dedup_reducs = set(), set(), set()
+            first_op_inputs, final_op_outputs = set(), set()
+            for i in range(len(ops)):
+                op = ops[i]
+                def dedup_add(l, s, val):
+                    if val not in s:
+                        s.add(val)
+                        l.append(val)
+                for input in op.inputs:
+                    dedup_add(new_inputs, dedup_inputs, input)
+                    if i == 0:
+                        first_op_inputs.add(input)
+                for output in op.outputs:
+                    dedup_add(new_outputs, dedup_outputs, output)
+                    if i == (len(ops) - 1):
+                        final_op_outputs.add(output)
+                for reduc, _ in op.reductions:
+                    dedup_add(new_reducs, dedup_reducs, reduc)
+
+            # We'll order the stores in the calling convention like [inputs, outputs, reductions],
+            # so we can construct a mapping from a particular store to an index in this concatenation.
+            store_id_to_index_mapping = {}
+            index = 0
+            # TODO (rohany): Haven't yet handled when the same store appears in
+            #  both the inputs and outputs here.
+            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                store_id_to_index_mapping[store._unique_id] = index
+                index += 1
+
+            new_input_descs = [s.to_comp_time_store_desc() for s in new_inputs]
+            new_output_descs = [s.to_comp_time_store_desc() for s in new_outputs]
+            new_reduc_descs = [s.to_comp_time_store_desc() for s in new_reducs]
+            # Now construct a new MLIR module that fuses all of the tasks together
+            # into a single body, and uses the constructed mappings to perform
+            # the remappings of each argument to the new arguments.
+            fused = PyMLIRModule.construct_fused_module(
+                modules,
+                new_input_descs,
+                new_output_descs,
+                new_reduc_descs,
+                store_id_to_index_mapping
+            )
+
+            # Here can be the application of Legate-specific transformations, such
+            # as the removal of temporary stores, and burning of store transformations.
+
+            ######### Temporary Elimination
+
+            # 1) Demote temporary stores to allocations local to task bodies.
+            # TODO (rohany): Brainstorming stuff here ....
+            #  * We can demote temporary stores that are not the input to
+            #    the first task in our fused buffer, and are not the output
+            #    or reduction of the final task in our buffer.
+            #  * The temporary store needs to also have a "locally computable"
+            #    set of dimensions (shape). The rules for this around unbound stores are
+            #    unclear for now, so we can punt that to later. The definition
+            #    of "locally computable" is that the shape of the local
+            #    allocation can be computed purely from the shapes of region arguments
+            #    to the task, and does not require any communication to compute.
+            #    It's likely the case (I haven't verified this yet), but temporaries
+            #    that require communication to compute the shapes of will not be
+            #    able to be fused anyway (unbound stores will make the rules here iffy).
+            #  * A store is temporary if it has no external references and is not
+            #    read by any operations remaining in the unfused portion of the
+            #    buffer at the time of fusion.
+
+            # As a first pass at computing resolved shapes for temporary allocations,
+            # let's first make a structure of all stores using the same partitioning.
+            same_partitions = {}
+            store_parts = {}
+            def add_partition(store, part):
+                nonlocal same_partitions
+                nonlocal store_parts
+                if part not in same_partitions:
+                    same_partitions[part] = set()
+                same_partitions[part].add(store)
+                if store not in store_parts:
+                    store_parts[store] = part
+            for op, strategy in zip(ops, strategies):
+                # TODO (rohany): Deal with reductions.
+                for input, sym in zip(op.inputs, op._input_parts):
+                    add_partition(input, strategy.get_partition(sym))
+                for output, sym in zip(op.outputs, op._output_parts):
+                    add_partition(output, strategy.get_partition(sym))
+
+            # Now find the temporary stores.
+            temporaries = []
+            temporary_store_ordinals = []
+            index = 0
+            durable_inputs, durable_outputs = [], []
+
+            # TODO (rohany): A generalization of the "not in first_op_inputs" is that
+            #  an input-only store can only be marked as temporary if it is defined (written to)
+            #  by an operation preceding it in the task pipeline.
+            # TODO (rohany): This is just a hack, not sure yet if I need a sliding window
+            #  kind of data structure.
+            defined_storages = set()
+            for op in ops:
+                for store in op.outputs:
+                    defined_storages.add(store._storage._unique_id)
+
+            # A store that is read from or reduced to by pending operations not in
+            # the buffer we are considering cannot be eliminated. However, if we
+            # do a direct write to the store before any subsequent reads, then it
+            # can be promoted, since the value written inside the fused task will
+            # not be the one read.
+            killed_pending_storages: Set[int] = set()
+            read_pending_storages: Set[int] = set()
+            for op in pending_ops:
+                for input in op.inputs:
+                    uid = input._storage._unique_id
+                    if uid not in killed_pending_storages:
+                        read_pending_storages.add(uid)
+                for reduc, _ in op.reductions:
+                    uid = input._storage._unique_id
+                    if uid not in killed_pending_storages:
+                        read_pending_storages.add(uid)
+                for output in op.outputs:
+                    killed_pending_storages.add(output._storage._unique_id)
+
+
+            for store in new_inputs:
+                if not store.has_external_references() and store._storage._unique_id in defined_storages:
+                    temporaries.append(store)
+                    temporary_store_ordinals.append(index)
+                else:
+                    durable_inputs.append(store)
+                index += 1
+            for store in new_outputs:
+                if not store.has_external_references() and store._storage._unique_id not in read_pending_storages:
+                    temporaries.append(store)
+                    temporary_store_ordinals.append(index)
+                else:
+                    durable_outputs.append(store)
+                index += 1
+            # TODO (rohany): I don't actually think reduction stores can be temporary?
+            # for store in new_reducs:
+            #     if not store.has_external_references():
+            #         temporaries.append(store)
+            #         temporary_store_ordinals.append(index)
+            #     else:
+            #         durable_reducs.append(store)
+            #     index += 1
+            new_inputs, new_outputs = durable_inputs, durable_outputs
+
+            store_id_to_index_mapping = {}
+            index = 0
+            # TODO (rohany): Haven't yet handled when the same store appears in
+            #  both the inputs and outputs here.
+            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                store_id_to_index_mapping[store._unique_id] = index
+                index += 1
+
+            # For each of the temporary stores, find a store that can be used to infer
+            # the shape of the local allocation. For now, this just means finding
+            # another store in the argument list that uses the same partition.
+            resolved_shape_ordinals = []
+            temporary_set = set(temporaries)
+            for temporary in temporaries:
+                part = store_parts[temporary]
+                other_stores = same_partitions[part] - temporary_set
+                resolved = next(iter(other_stores))
+                resolved_shape_ordinals.append(store_id_to_index_mapping[resolved._unique_id])
+
+            fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
+
+            # fused.dump()
+
+            ######### Done Temporary Elimination
+
+            ######### Intermediate store privilege escalation pass
+
+            # Since we are fusing multiple tasks together, there is some
+            # funkiness around privileges that we also need to handle. In
+            # particular, consider when a task T1 defines an output S, which
+            # T2 uses as input. In a standard execution, this is fine. However,
+            # when we fuse T1 and T2, we would add S as input and output to
+            # fused(T1, T2). This is a problem, as then we'll ask for read-write
+            # permissions on S, even though it hasn't yet been written to before
+            # the read. This pass eliminates S from the input of the fused task,
+            # and just treats it as output. This isn't just a metadata transformation,
+            # as we need to remove the stores from the arguments of the generated.
+            defined_by_op = []
+            for op in ops:
+                cur_defs = set([store._storage._unique_id for store in op.outputs])
+                if len(defined_by_op) == 0:
+                    defined_by_op.append(cur_defs)
+                else:
+                    defined_by_op.append(cur_defs.union(defined_by_op[-1]))
+            defined_before_used = set()
+            for i in range(len(ops)):
+                op = ops[i]
+                if i > 0:
+                    for store in op.inputs:
+                        if store._storage._unique_id in defined_by_op[i - 1]:
+                            defined_before_used.add(store._storage._unique_id)
+
+            inputs_after_intermediate_promotion = []
+            intermediate_input_indexes = []
+            intermediates = []
+            index = 0
+            for input in new_inputs:
+                if input._storage._unique_id not in defined_before_used:
+                    inputs_after_intermediate_promotion.append(input)
+                else:
+                    intermediate_input_indexes.append(index)
+                    intermediates.append(input)
+                index += 1
+            resolved_input_indexes = []
+            for input in intermediates:
+                # TODO (rohany): We can accelerate this search later.
+                for i, store in enumerate(new_outputs):
+                    if store._unique_id == input._unique_id:
+                        resolved_input_indexes.append(i + len(new_inputs))
+                        break
+
+            new_inputs = inputs_after_intermediate_promotion
+            fused.escalateIntermediateStorePrivilege(intermediate_input_indexes, resolved_input_indexes)
+
+            # TODO (rohany): Every time we change the set of inputs and outputs we have
+            #  to recompute this mapping.
+            store_id_to_index_mapping = {}
+            index = 0
+            # TODO (rohany): Haven't yet handled when the same store appears in
+            #  both the inputs and outputs here.
+            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                store_id_to_index_mapping[store._unique_id] = index
+                index += 1
+
+            ######### Standard pass application
+
+            fused.optimize(target_variant)
+
+            ######### Done standard pass application
+
+            fused.dump()
+
+            # TODO (rohany): At this point, all of the analysis being done to the
+            #  task should be finished.
+
+            fused.lowerToLLVMDialect(target_variant)
+
+            # fused.dump()
+            funcptr = fused.jitToLLVM()
+
+            local_task_id = ops[0].context.get_fresh_local_task_id()
+            PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id), target_variant)
+            fusionDesc = FusedTaskConstructionDescriptor(ops, new_inputs, new_outputs, new_reducs, local_task_id, funcptr)
+            self._fused_task_window_cache[task_window_desc] = fusionDesc
+        return fusionDesc.build_task(ops, strategies)
+
+    def _schedule(self, ops: List[Operation], flush: bool) -> int:
+        from .solver import Partitioner
+        from .operation import AutoTask
+
+        # If we aren't doing any sort of kernel fusion, always flush the entire
+        # buffer of tasks, since there isn't any point of waiting. We duplicate
+        # some partition strategy generation code here, due to avoid complicating
+        # the code along the fusion path.
+        if not settings.kernel_fusion():
+            # TODO: For now we run the partitioner for each operation separately.
+            #       We will eventually want to compute a trace-wide partitioning
+            #       strategy.
+
+            # Invoke the partitioner for each operation, and then launch all
+            # of the operations.
+            strategies = []
+            for op in ops:
+                must_be_single = len(op.scalar_outputs) > 0
+                partitioner = Partitioner([op], must_be_single=must_be_single)
+                with op.target_machine:
+                    strategies.append(partitioner.partition_stores())
+
+            for op, strategy in zip(ops, strategies):
+                with op.target_machine:
+                    op.launch(strategy)
+
+            return len(ops)
+
+        # If we are considering fusion, we instead need to be careful around
+        # how we construct partitioning strategies for each operation. Invoking
+        # the partitioner is not a cheap operation, so we want to avoid running
+        # the partitioner repeatedly on our entire buffer of tasks if we only
+        # will select a prefix of the tasks to fuse. Instead, we'll lazily
+        # invoke the partitioner from inside the FusionConstraintManager so
+        # that we always have at least enough partitioning strategies stored
+        # to make a decision about fusion.
+        def generate_new_strategy(op, strategies):
             must_be_single = len(op.scalar_outputs) > 0
             partitioner = Partitioner([op], must_be_single=must_be_single)
-            # TODO: When we start partitioning a batch of operations, changes
-            # of machine configuration would delineat the batches
             with op.target_machine:
                 strategies.append(partitioner.partition_stores())
 
@@ -1417,428 +1757,98 @@ class Runtime:
             # However, we want to consider temporaries that we have in the middle
             # of a big window to eventually have key partitions based on how
             # we partition them, so set those after we finish the first partitioning pass.
-            if settings.kernel_fusion():
-                if isinstance(op, AutoTask):
-                    for store, sym in zip(op.outputs, op._output_parts):
-                        part = strategies[-1].get_partition(sym)
-                        store.set_key_partition(part)
+            if isinstance(op, AutoTask):
+                for store, sym in zip(op.outputs, op._output_parts):
+                    part = strategies[-1].get_partition(sym)
+                    store.set_key_partition(part)
 
-        # TODO (rohany): I think it's time to try and write some kind of fusion
-        #  here. I think the goal for now is to first get the whole pipeline
-        #  working on the MLIR/LLVM side, so I think the prudent way forward
-        #  is to be lazy right now on figuring out what to fuse, and either
-        #  fuse everything in the window if all repeated stores have the exact
-        #  same partitions, or issue every task in the buffer independently.
+        # Record the original buffer of tasks before we go and mess with it.
+        original_ops = ops
+        # Maintain the growing and shrinking list of strategies.
+        strategies = []
 
-        fusablePrefix = 0
-        if settings.kernel_fusion():
+        # At this point, we're going to consider fusing tasks. We're given a buffer
+        # of tasks, and we'll select some prefix of it to fuse together and dispatch.
+        # This code is nested inside a loop because of the flush argument, which represents
+        # if our goal is to consume the entire buffer. If we are to consume the entire
+        # buffer, then we will continuously munch tasks from the buffer until it empties.
+        # Otherwise, we'll munch a single task from the buffer and return control to
+        # the application.
+        while len(ops) > 0:
             constraintMgr = FusionConstraintManager()
-            # TODO (rohany): Can use a singleton for these objects.
+            # TODO (rohany): Can use a singleton for the constraint objects
+            #  that don't manipulate internal state.
             constraintMgr.register_constraint(AutoTaskConstraint())
             constraintMgr.register_constraint(MLIRVariantConstraint())
+            constraintMgr.register_constraint(SupportedStoreTransformsConstraint())
             constraintMgr.register_constraint(MachineConstraint())
-            constraintMgr.register_constraint(PartitionEquivalenceConstraint())
-            fusablePrefix = constraintMgr.compute_fusable_prefix(ops, strategies)
+            constraintMgr.register_constraint(ProducerConsumerViewConstraint())
+            constraintMgr.register_constraint(PartitionAliasingViewConstraint())
+            constraintMgr.register_constraint(AliasingReadWriteViewConstraint())
+            fusablePrefix = constraintMgr.compute_fusable_prefix(ops, strategies, generate_new_strategy)
+            print("Fusing this many tasks: ", fusablePrefix)
 
-        if fusablePrefix > 0:
-            # TODO (rohany): Have to change this to ask for
-            #  feedback from the generated tasks, whether they can
-            #  target the same task variants or not etc.
-            target_variant = self.core_task_variant_id
-            # Now we have to actually generate a fused task body.
-            # Things that need to be accomplished:
-            # 1) Demotion of temporary stores into local allocations.
-            #    The rules for this need to be thought through more clearly,
-            #    because we have to take into account the partitioning constraint
-            #    being applied to the temporary stores to really make them
-            #    temporary, as well as to figure out what the sizes of those
-            #    local allocations should be, in case they don't get removed.
-            #    TODO (rohany): I think that for now, we can just assume that
-            #     the only constraints being used are tiling and alignment
-            #     constraints, so we can just use the sizes of one of the
-            #     other stores for the size of the local allocations.
-            # 2) The building of a super-task that contains all of the task bodies
-            #    of the original tasks, but has also eliminated redundant stores
-            #    from the inputs of each task, so that the super task takes in
-            #    a unique set of inputs.
-            # 3) The application of MLIR optimization passes on the generated
-            #    super-task that actually optimize the resulting code.
-
-            task_window_desc = TaskWindowDescriptor(ops)
-            if task_window_desc in self._fused_task_window_cache:
-                fusionDesc = self._fused_task_window_cache[task_window_desc]
-            else:
-                # We missed the cache, so do all of the necessary analysis.
-
-                # First construct MLIR modules for each of the task bodies.
-                modules = []
-                for op in ops:
-                    tid = op._task_id
-                    info = op.context._cpp_context.find_task(tid)
-                    gen = info.get_mlir_body_generator()
-                    inputs = [s.to_comp_time_store_desc() for s in op.inputs]
-                    outputs = [s.to_comp_time_store_desc() for s in op.outputs]
-                    reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
-
-                    # TODO (rohany): Pack the arguments into a buffer for the tasks.
-                    builder = BufferBuilder()
-                    for arg, dtype in op._scalar_args:
-                        scalar = ScalarArg(arg, dtype)
-                        scalar.pack(builder)
-                    buffer = bytes(builder.get_string())
-                    bufSize = builder.get_size()
-                    modules.append(gen.generate_body(inputs, outputs, reducs, buffer, bufSize))
-
-                # We have to come up with a calling convention here for the fused task.
-                # The simplest thing to do is group all inputs, then outputs, then reductions.
-                # So I'll deduplicate each of the sets of stores, and use that to remap
-                # all of the inputs from each task to the new arguments of the super-task.
-                new_inputs, new_outputs, new_reducs = [], [], []
-                dedup_inputs, dedup_outputs, dedup_reducs = set(), set(), set()
-                first_op_inputs, final_op_outputs = set(), set()
-                for i in range(len(ops)):
-                    op = ops[i]
-                    def dedup_add(l, s, val):
-                        if val not in s:
-                            s.add(val)
-                            l.append(val)
-                    for input in op.inputs:
-                        dedup_add(new_inputs, dedup_inputs, input)
-                        if i == 0:
-                            first_op_inputs.add(input)
-                    for output in op.outputs:
-                        dedup_add(new_outputs, dedup_outputs, output)
-                        if i == (len(ops) - 1):
-                            final_op_outputs.add(output)
-                    for reduc, _ in op.reductions:
-                        dedup_add(new_reducs, dedup_reducs, reduc)
-
-                # We'll order the stores in the calling convention like [inputs, outputs, reductions],
-                # so we can construct a mapping from a particular store to an index in this concatenation.
-                store_id_to_index_mapping = {}
-                index = 0
-                # TODO (rohany): Haven't yet handled when the same store appears in
-                #  both the inputs and outputs here.
-                for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                    store_id_to_index_mapping[store._unique_id] = index
-                    index += 1
-
-                new_input_descs = [s.to_comp_time_store_desc() for s in new_inputs]
-                new_output_descs = [s.to_comp_time_store_desc() for s in new_outputs]
-                new_reduc_descs = [s.to_comp_time_store_desc() for s in new_reducs]
-                # Now construct a new MLIR module that fuses all of the tasks together
-                # into a single body, and uses the constructed mappings to perform
-                # the remappings of each argument to the new arguments.
-                fused = PyMLIRModule.construct_fused_module(
-                    modules,
-                    new_input_descs,
-                    new_output_descs,
-                    new_reduc_descs,
-                    store_id_to_index_mapping
-                )
-                # TODO (rohany): I want to perform unification in the generated task
-                #  arguments when a store in inputs and outputs gets promoted to read-write.
-                # fused.dump()
-
-                # Here can be the application of Legate-specific transformations, such
-                # as the removal of temporary stores, and burning of store transformations.
-
-                ######### Temporary Elimination
-
-                # 1) Demote temporary stores to allocations local to task bodies.
-                # TODO (rohany): Brainstorming stuff here ....
-                #  * We can demote temporary stores that are not the input to
-                #    the first task in our fused buffer, and are not the output
-                #    or reduction of the final task in our buffer.
-                #  * The temporary store needs to also have a "locally computable"
-                #    set of dimensions (shape). The rules for this around unbound stores are
-                #    unclear for now, so we can punt that to later. The definition
-                #    of "locally computable" is that the shape of the local
-                #    allocation can be computed purely from the shapes of region arguments
-                #    to the task, and does not require any communication to compute.
-                #    It's likely the case (I haven't verified this yet), but temporaries
-                #    that require communication to compute the shapes of will not be
-                #    able to be fused anyway (unbound stores will make the rules here iffy).
-
-
-                # TODO (rohany):
-                #  Rules for temporary elimination that will come up later when we do
-                #  fusion of partial task buffers:
-                #  A store is temporary if it has no external references and is not
-                #  read by any operations remaining in the unfused portion of the
-                #  buffer at the time of fusion.
-
-                # As a first pass at computing resolved shapes for temporary allocations,
-                # let's first make a structure of all stores using the same partitioning.
-                same_partitions = {}
-                store_parts = {}
-                def add_partition(store, part):
-                    nonlocal same_partitions
-                    nonlocal store_parts
-                    if part not in same_partitions:
-                        same_partitions[part] = set()
-                    same_partitions[part].add(store)
-                    if store not in store_parts:
-                        store_parts[store] = part
-                for op, strategy in zip(ops, strategies):
-                    # TODO (rohany): Deal with reductions.
-                    for input, sym in zip(op.inputs, op._input_parts):
-                        add_partition(input, strategy.get_partition(sym))
-                    for output, sym in zip(op.outputs, op._output_parts):
-                        add_partition(output, strategy.get_partition(sym))
-
-                # Now find the temporary stores.
-                temporaries = []
-                temporary_store_ordinals = []
-                index = 0
-                durable_inputs, durable_outputs = [], []
-
-                # TODO (rohany): A generalization of the "not in first_op_inputs" is that
-                #  an input-only store can only be marked as temporary if it is defined (written to)
-                #  by an operation preceding it in the task pipeline.
-                # TODO (rohany): This is just a hack, not sure yet if I need a sliding window
-                #  kind of data structure.
-                defined_storages = set()
-                for op in ops:
-                    for store in op.outputs:
-                        defined_storages.add(store._storage._unique_id)
-
-                for store in new_inputs:
-                    if not store.has_external_references() and store._storage._unique_id in defined_storages:
-                        temporaries.append(store)
-                        temporary_store_ordinals.append(index)
-                    else:
-                        durable_inputs.append(store)
-                    index += 1
-                for store in new_outputs:
-                    # TODO (rohany): This check of final_op_outputs should really be (as
-                    #  discussed above somewhere) that there aren't any operations in
-                    #  un-executed parts of the buffer that use this storage as an input.
-                    if not store.has_external_references() and store not in final_op_outputs:
-                        temporaries.append(store)
-                        temporary_store_ordinals.append(index)
-                    else:
-                        durable_outputs.append(store)
-                    index += 1
-                # TODO (rohany): I don't actually think reduction stores can be temporary?
-                # for store in new_reducs:
-                #     if not store.has_external_references():
-                #         temporaries.append(store)
-                #         temporary_store_ordinals.append(index)
-                #     else:
-                #         durable_reducs.append(store)
-                #     index += 1
-                new_inputs, new_outputs = durable_inputs, durable_outputs
-
-                # print([store._unique_id for store in new_inputs], [store._unique_id for store in new_outputs])
-
-                store_id_to_index_mapping = {}
-                index = 0
-                # TODO (rohany): Haven't yet handled when the same store appears in
-                #  both the inputs and outputs here.
-                for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                    store_id_to_index_mapping[store._unique_id] = index
-                    index += 1
-
-                # For each of the temporary stores, find a store that can be used to infer
-                # the shape of the local allocation. For now, this just means finding
-                # another store in the argument list that uses the same partition.
-                resolved_shape_ordinals = []
-                temporary_set = set(temporaries)
-                for temporary in temporaries:
-                    part = store_parts[temporary]
-                    other_stores = same_partitions[part] - temporary_set
-                    resolved = next(iter(other_stores))
-                    resolved_shape_ordinals.append(store_id_to_index_mapping[resolved._unique_id])
-
-                fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
-
-                # fused.dump()
-
-                ######### Done Temporary Elimination
-
-                ######### Intermediate store privilege escalation pass
-
-                # Since we are fusing multiple tasks together, there is some
-                # funkiness around privileges that we also need to handle. In
-                # particular, consider when a task T1 defines an output S, which
-                # T2 uses as input. In a standard execution, this is fine. However,
-                # when we fuse T1 and T2, we would add S as input and output to
-                # fused(T1, T2). This is a problem, as then we'll ask for read-write
-                # permissions on S, even though it hasn't yet been written to before
-                # the read. This pass eliminates S from the input of the fused task,
-                # and just treats it as output. This isn't just a metadata transformation,
-                # as we need to remove the stores from the arguments of the generated.
-                defined_by_op = []
-                for op in ops:
-                    cur_defs = set([store._storage._unique_id for store in op.outputs])
-                    if len(defined_by_op) == 0:
-                        defined_by_op.append(cur_defs)
-                    else:
-                        defined_by_op.append(cur_defs.union(defined_by_op[-1]))
-                defined_before_used = set()
-                for i in range(len(ops)):
-                    op = ops[i]
-                    if i > 0:
-                        for store in op.inputs:
-                            if store._storage._unique_id in defined_by_op[i - 1]:
-                                defined_before_used.add(store._storage._unique_id)
-
-                inputs_after_intermediate_promotion = []
-                intermediate_input_indexes = []
-                intermediates = []
-                index = 0
-                for input in new_inputs:
-                    if input._storage._unique_id not in defined_before_used:
-                        inputs_after_intermediate_promotion.append(input)
-                    else:
-                        intermediate_input_indexes.append(index)
-                        intermediates.append(input)
-                    index += 1
-                resolved_input_indexes = []
-                for input in intermediates:
-                    # TODO (rohany): We can accelerate this search later.
-                    for i, store in enumerate(new_outputs):
-                        if store._unique_id == input._unique_id:
-                            resolved_input_indexes.append(i + len(new_inputs))
-                            break
-
-                new_inputs = inputs_after_intermediate_promotion
-                fused.escalateIntermediateStorePrivilege(intermediate_input_indexes, resolved_input_indexes)
-
-                # TODO (rohany): Every time we change the set of inputs and outputs we have
-                #  to recompute this mapping.
-                store_id_to_index_mapping = {}
-                index = 0
-                # TODO (rohany): Haven't yet handled when the same store appears in
-                #  both the inputs and outputs here.
-                for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                    store_id_to_index_mapping[store._unique_id] = index
-                    index += 1
-
-                ######### Standard pass application
-
-                fused.optimize(target_variant)
-
-                ######### Done standard pass application
-
-                # fused.dump()
-
-                # TODO (rohany): At this point, all of the analysis being done to the
-                #  task should be finished.
-
-                fused.lowerToLLVMDialect(target_variant)
-
-                # fused.dump()
-                funcptr = fused.jitToLLVM()
-
-                local_task_id = ops[0].context.get_fresh_local_task_id()
-                PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id), target_variant)
-                fusionDesc = FusedTaskConstructionDescriptor(ops, new_inputs, new_outputs, new_reducs, local_task_id, funcptr)
-                self._fused_task_window_cache[task_window_desc] = fusionDesc
-
-            newTask, newStrat = fusionDesc.build_task(ops, strategies)
-
-            ops = [newTask]
-            strategies = [newStrat]
-        else:
-            # Try to replace tasks by JIT-ed variants, and remap the partitioning
-            # strategy of the tasks over to the newly created task.
-            for i in range(len(ops)):
-                # TODO (rohany): Temporarily disable the jitting of single tasks.
-                break
-
-
-                op, strategy = ops[i], strategies[i]
-                if not settings.kernel_fusion():
+            # If we can't fuse any operations at the start of the window,
+            # launch the first operation available. If we weren't requested
+            # to flush, return. A fusable prefix of 0 usually means that the
+            # first operation in the buffer was something that the fusion
+            # system can't handle at all. Things like a single auto-task that
+            # has a JIT-able implementation will be in a fusion window of size 1,
+            # so we'll get the code generation for it from the pass below.
+            if fusablePrefix == 0:
+                op, strategy = ops[0], strategies[0]
+                with op.target_machine:
+                    op.launch(strategy)
+                if flush:
+                    ops, strategies = ops[1:], strategies[1:]
                     continue
-                if not isinstance(op, AutoTask):
-                    continue
-
-                tid = op._task_id
-                info = op.context._cpp_context.find_task(tid)
-                assert(info.valid)
-                if not info.has_mlir_variant():
-                    continue
-
-                gen = info.get_mlir_body_generator()
-                inputs = [s.to_comp_time_store_desc() for s in op.inputs]
-                outputs = [s.to_comp_time_store_desc() for s in op.outputs]
-                reducs = [s[0].to_comp_time_store_desc() for s in op.reductions]
-                desc = GeneratedTaskDescriptor(op.context.get_task_id(tid), inputs, outputs, reducs)
-                if desc in self._generated_kernel_cache:
-                    local_task_id, funcptr = self._generated_kernel_cache[desc]
                 else:
-                    # For now, assume that there isn't any additional information
-                    # that we need to provide tasks with generate their task bodies
-                    # other than a list of all the stores they access. We can also
-                    # assume that the tasks generators don't get to use any information
-                    # about the stores other than their data types and number of dimensions.
-                    builder = BufferBuilder()
-                    for arg, dtype in op._scalar_args:
-                        scalar = ScalarArg(arg, dtype)
-                        scalar.pack(builder)
-                    buffer = bytes(builder.get_string())
-                    bufSize = builder.get_size()
+                    return 1
 
-                    module = gen.generate_body(inputs, outputs, reducs, buffer, bufSize)
-                    # module.dump()
-                    module.optimize()
-                    module.lowerToLLVMDialect()
-                    # module.dump()
-                    funcptr = module.jitToLLVM()
-                    local_task_id = op.context.get_fresh_local_task_id()
-                    PyMLIRTask.register_variant("JITTED_SINGLE_TASK", op.context.get_task_id(local_task_id))
-                    self._generated_kernel_cache[desc] = (local_task_id, funcptr)
-                # Now construct a new AutoTask using this ID.
-                newTask = op.context.create_auto_task(local_task_id)
-                for input in op.inputs:
-                    newTask.add_input(input)
-                for output in op.outputs:
-                    newTask.add_output(output)
-                assert(len(op.reductions) == 0)
+            # Now, we have a non-zero prefix of tasks to consider fusion. Run
+            # the fusion analysis on the designated prefix.
+            newTask, newStrat = self._fuse_buffer(ops[:fusablePrefix], strategies[:fusablePrefix], ops[fusablePrefix:])
+            with newTask.target_machine:
+                newTask.launch(newStrat)
+            if flush:
+                ops, strategies = ops[fusablePrefix:], strategies[fusablePrefix:]
+                continue
+            else:
+                return fusablePrefix
 
-                # TODO (rohany): Whoops, binop doesn't accept scalar args yet.
-                # assert(len(op._scalar_args) == 0)
-                newTask.add_scalar_arg(funcptr, ty.uint64)
-                ops[i] = newTask
-
-                # Now remap the partition symbols over to the task.
-                part_sym_mapping = {}
-                for src, dest in zip(op._input_parts, newTask._input_parts):
-                    part_sym_mapping[src] = dest
-                for src, dest in zip(op._output_parts, newTask._output_parts):
-                    part_sym_mapping[src] = dest
-                # TODO (rohany): Do the reduction parts here.
-                strategies[i] = strategy.remap(part_sym_mapping)
-
-
-
-        for op, strategy in zip(ops, strategies):
-            # TODO (rohany): Some old code to ensure that library reference
-            #  counting works.
-            # refcnts = []
-            # for store in op.inputs:
-            #     refcnts.append(store._num_external_references)
-            # for store in op.outputs:
-            #     refcnts.append(store._num_external_references)
-            # print(op, refcnts)
-            with op.target_machine:
-                op.launch(strategy)
+        # If we made it here, we consumed the entire buffer.
+        return len(original_ops)
 
     def flush_scheduling_window(self) -> None:
         if len(self._outstanding_ops) == 0:
             return
         ops = self._outstanding_ops
         self._outstanding_ops = []
-        self._schedule(ops)
+        munched = self._schedule(ops, True)
+        assert(munched == len(ops))
+
+    # munch_scheduling_window is slightly different than flush_scheduling_window in
+    # that it doesn't try to consume the entire window, but instead consumes as much
+    # of it as can be fused into a single task.
+    def munch_scheduling_window(self) -> None:
+        if len(self._outstanding_ops) == 0:
+            return
+        ops = self._outstanding_ops
+        # Importantly, we need to set self._outstanding_ops to [] before
+        # calling _schedule as methods used in _schedule may recursively
+        # invoke flush_scheduling_window. Setting self._outstanding_ops to
+        # [] before ensures that recursive calls to flush have no effect.
+        self._outstanding_ops = []
+        munched = self._schedule(ops, False)
+        self._outstanding_ops = ops[munched:]
+
 
     def submit(self, op: Operation) -> None:
         if op.can_raise_exception and self._precise_exception_trace:
             op.capture_traceback()
         self._outstanding_ops.append(op)
         if len(self._outstanding_ops) >= self._window_size:
-            self.flush_scheduling_window()
+            self.munch_scheduling_window()
         if len(self._pending_exceptions) >= self._max_pending_exceptions:
             self.raise_exceptions()
 

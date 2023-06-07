@@ -598,6 +598,9 @@ class TransformStackBase(TransformProto, Protocol):
     def to_cpp_transform_stack(self) -> PyTransformStack:
         ...
 
+    def jit_supported(self) -> bool:
+        ...
+
 
 class TransformStack(TransformStackBase):
     def __init__(
@@ -635,6 +638,12 @@ class TransformStack(TransformStackBase):
                 # print(type(tx))
                 assert(False)
         return result
+
+    def jit_supported(self) -> bool:
+        tx = self._transform
+        if not isinstance(tx, (Promote, Shift, Transpose)):
+            return False
+        return self._parent.jit_supported()
 
     @property
     def convertible(self) -> bool:
@@ -759,6 +768,9 @@ class IdentityTransform(TransformStackBase):
 
     def to_cpp_transform_stack(self) -> PyTransformStack:
         return PyTransformStack()
+
+    def jit_supported(self) -> bool:
+        return True
 
 
 identity = IdentityTransform()

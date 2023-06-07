@@ -17,8 +17,10 @@ from __future__ import annotations
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
+    Set,
     Tuple,
 )
 
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
     from .operation import AutoTask, Task, Operation
     from .partition import PartitionBase
     from .solver import Strategy
-    from .store import Store
+    from .store import Store, Storage
 
 # TODO (rohany): I plan on having runtime import this module,
 #  so let's be careful to avoid circular imports.
@@ -41,7 +43,7 @@ if TYPE_CHECKING:
 # The apply method may maintain internal state while processing task buffers.
 class FusionConstraint:
     def apply(self, op: Operation, strat: Strategy) -> bool:
-        pass
+        raise NotImplementedError
 
 
 # AutoTaskConstraint checks whether the operation is indeed an AutoTask.
@@ -74,30 +76,108 @@ class MachineConstraint(FusionConstraint):
             return self._machine == op.target_machine
 
 
-# PartitionEquivalenceConstraint checks that each store is used in
-# the same partition (i.e. the same view) across the window. If a store
-# is viewed in multiple different ways, this implies communication, and
-# thus no fusion.
-class PartitionEquivalenceConstraint(FusionConstraint):
+# SupportedStoreTransformsConstraints ensures that all stores
+# used by the operation are transformed in a way that the
+# underlying code generator can handle.
+class SupportedStoreTransformsConstraint(FusionConstraint):
+    def apply(self, op: Operation, _: Strategy) -> bool:
+        for input in op.inputs:
+            if not input.transform.jit_supported():
+                return False
+        for output in op.outputs:
+            if not output.transform.jit_supported():
+                return False
+        for reduc, _ in op.reductions:
+            if not reduc.transform.jit_supported():
+                return False
+        return True
+
+
+# ProducerConsumerViewConstraint checks that if we write to particular
+# view of a store, then we can subsequently only perform reads from that
+# same view of the store.
+# TODO (rohany): Like the partition aliasing checks below, I'm not sure if
+#  we need to have a similar check on partitions.
+class ProducerConsumerViewConstraint(FusionConstraint):
     def __init__(self):
-        self._store_parts = {}
+        self._storage_views: Dict[Storage, Store] = {}
+
+    def apply(self, op: Operation, _: Strategy) -> bool:
+        # TODO (rohany): Handle reductions.
+        for input in op.inputs:
+            root = input._storage.get_root()
+            # TODO (rohany): I think we want a deeper check of equality here.
+            if root in self._storage_views and self._storage_views[root] != input:
+                return False
+        for output in op.outputs:
+            root = output._storage.get_root()
+            # TODO (rohany): I think we want a deeper check of equality here.
+            if root in self._storage_views and self._storage_views[root] != output:
+                return False
+            if root not in self._storage_views:
+                self._storage_views[root] = output
+        return True
+
+
+# PartitioningAliasingViewConstraint checks that we do not read from multiple
+# views of the same data while simulateneously writing to one of the views
+# of the data. Reading from multiple views of the data is supported by Legion.
+class PartitionAliasingViewConstraint(FusionConstraint):
+    def __init__(self):
+        self._read_partitions: Dict[Storage, Set[PartitionBase]] = {}
 
     def apply(self, op: Operation, strat: Strategy) -> bool:
         # TODO (rohany): Handle reductions.
         for input, sym in zip(op.inputs, op._input_parts):
-            if not self._check(input, strat.get_partition(sym)):
-                return False
+            # Record this input partition as a read partition of the root.
+            root = input._storage.get_root()
+            if root not in self._read_partitions:
+                self._read_partitions[root] = set()
+            self._read_partitions[root].add(strat.get_partition(sym))
         for output, sym in zip(op.outputs, op._output_parts):
-            if not self._check(output, strat.get_partition(sym)):
-                return False
+            # If we write to a particular storage, then this partition
+            # should be the only partition that we are reading from.
+            root = output._storage.get_root()
+            if root in self._read_partitions:
+                parts = self._read_partitions[root]
+                if len(parts) > 1:
+                    return False
+                part = next(iter(parts))
+                if part != strat.get_partition(sym):
+                    return False
         return True
 
-    def _check(self, store: Store, part: PartitionBase) -> bool:
-        if store not in self._store_parts:
-            self._store_parts[store] = part
-            return True
-        else:
-            return self._store_parts[store] == part
+
+# AliasingReadWriteViewConstraint is similar to PartitionAliasingViewConstraint
+# but checks equivalence at the level of transforms applied to each store. The
+# PartitionBase objects that we read and write to stores with might be the same,
+# but the underlying transforms on each store can cause the final partitions of
+# those stores to be different.
+class AliasingReadWriteViewConstraint(FusionConstraint):
+    def __init__(self):
+        self._read_storage_views: Dict[Storage, Set[Store]] = {}
+
+    def apply(self, op: Operation, _: Strategy) -> bool:
+        # TODO (rohany): Handle reductions.
+        # Just like above, make sure all the views of a particular storage
+        # are recorded, and error out if we write while reading multiple
+        # views of the same storage.
+        for input in op.inputs:
+            root = input._storage.get_root()
+            if root not in self._read_storage_views:
+                self._read_storage_views[root] = set()
+            self._read_storage_views[root].add(input)
+        for output in op.outputs:
+            root = output._storage.get_root()
+            if root in self._read_storage_views:
+                views = self._read_storage_views[root]
+                if len(views) > 1:
+                    return False
+                view = next(iter(views))
+                # TODO (rohany): I think we want a deeper check of equality here.
+                if view != output:
+                    return False
+        return True
 
 
 # FusionConstraintManager manages a set of user-provided fusion constraints,
@@ -111,8 +191,18 @@ class FusionConstraintManager:
 
     # compute_fusable_prefix returns how large of a prefix of the input
     # list of operations may be fused together.
-    def compute_fusable_prefix(self, ops: List[Operation], strategy: List[Strategy]) -> int:
-        for idx, (op, strat) in enumerate(zip(ops, strategy)):
+    def compute_fusable_prefix(
+        self,
+        ops: List[Operation],
+        strategy: List[Strategy],
+        generate_new_strategy: Callable[[Operation, List[Strategy]], None]
+    ) -> int:
+        for idx, op in enumerate(ops):
+            # If we don't have enough strategies, generate a new one.
+            if idx >= len(strategy):
+                generate_new_strategy(op, strategy)
+                assert(idx < len(strategy))
+            strat = strategy[idx]
             for constraint in self._constraints:
                 if not constraint.apply(op, strat):
                     return idx
@@ -266,7 +356,7 @@ class FusedTaskConstructionDescriptor:
         for store in reducs:
             self.reducs.append(store_to_orig_pos[store._unique_id])
 
-    def build_task(self, ops: List[Task], strategies: List[Strategy]) -> Tuple[Task, Strategy]:
+    def build_task(self, ops: List[Task], strategies: List[Strategy]) -> Tuple[Operation, Strategy]:
         # TODO (rohany): Worry about when these ops come from different libraries.
         newTask = ops[0].context.create_auto_task(self.taskid)
         self.add_stores_to_task(newTask, ops)
