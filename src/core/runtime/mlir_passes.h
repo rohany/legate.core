@@ -17,6 +17,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
+
 #include <vector>
 #include <map>
 
@@ -89,5 +91,9 @@ public:
 private:
   llvm::StringMap<std::unique_ptr<llvm::MemoryBuffer>> cachedObjects;
 };
+
+// handleJITLookupError handles an error when the JIT is unable to find
+// a symbol. It is placed here because it requires RTTI in debug builds.
+void handleJITLookupError(llvm::Expected<llvm::orc::ExecutorAddr>& symbol);
 
 }

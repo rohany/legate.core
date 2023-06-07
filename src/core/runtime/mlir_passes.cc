@@ -305,4 +305,11 @@ void SimpleObjectCache::dumpAllObjectsToFile(llvm::StringRef filename) {
 
 bool SimpleObjectCache::isEmpty() { return cachedObjects.empty(); }
 
+void handleJITLookupError(llvm::Expected<llvm::orc::ExecutorAddr>& symbol) {
+  std::string errorMessage;
+  llvm::raw_string_ostream os(errorMessage);
+  llvm::handleAllErrors(symbol.takeError(),
+                        [&os](llvm::ErrorInfoBase &ei) { ei.log(os); });
+}
+
 }

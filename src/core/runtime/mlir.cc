@@ -481,10 +481,7 @@ uintptr_t MLIRModule::jitToLLVM(MLIRRuntime* runtime) {
   // string before returning. Alternatively, ORC JIT should consider copying
   // the string into the error message.
   if (!expectedSymbol) {
-    std::string errorMessage;
-    llvm::raw_string_ostream os(errorMessage);
-    llvm::handleAllErrors(expectedSymbol.takeError(),
-                          [&os](llvm::ErrorInfoBase &ei) { ei.log(os); });
+    handleJITLookupError(expectedSymbol);
     assert(false);
     return 0;
   }
