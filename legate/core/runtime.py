@@ -57,7 +57,7 @@ from . import (
     types as ty,
 )
 from ._legion.env import LEGATE_MAX_FIELDS
-from ._legion.util import Dispatchable
+from ._legion.util import Dispatchable, Logger
 from ._lib.context import CppRuntime, PyMLIRModule, PyMLIRTask  # type: ignore[import]
 from .allocation import Attachable
 from .communicator import CPUCommunicator, NCCLCommunicator
@@ -1191,6 +1191,7 @@ class Runtime:
         # pointer to use for the kernel.
         self._generated_kernel_cache: dict[GeneratedTaskDescriptor, tuple[int, int]] = {}
         self._fused_task_window_cache: dict[TaskWindowDescriptor, FusedTaskConstructionDescriptor] = {}
+        self._fusion_logger = Logger("fusion")
 
     @property
     def has_cpu_communicator(self) -> bool:
@@ -1346,6 +1347,9 @@ class Runtime:
 
         # Then we also need to raise all exceptions if there were any
         self.raise_exceptions()
+
+        # Destroy all registered loggers.
+        self._fusion_logger.destroy()
 
         self._comm_manager.destroy()
         for barrier in self._barriers:
@@ -1740,7 +1744,7 @@ class Runtime:
             constraintMgr.register_constraint(PartitionAliasingViewConstraint())
             constraintMgr.register_constraint(AliasingReadWriteViewConstraint())
             fusablePrefix = constraintMgr.compute_fusable_prefix(ops, strategies, generate_new_strategy)
-            print("Fusing this many tasks: ", fusablePrefix)
+            self._fusion_logger.info(f"Fusing {fusablePrefix} tasks out of a buffer of {len(ops)}.")
 
             # If we can't fuse any operations at the start of the window,
             # launch the first operation available. If we weren't requested
