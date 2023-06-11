@@ -219,9 +219,7 @@ class TaskWindowDescriptor:
 
         # Need to check several things:
         # 1) The set of task IDs is the same.
-        #    1b. TODO (rohany): Also need to check that the scalar arguments to the tasks are
-        #        the same, for example binary ops... Have to think about how to
-        #        do this easily.
+        #    1b. Check that the scalar arguments to the tasks are the same.
         # 2) All input stores have same dimensions, types and transforms.
         # 3) The reference count status of each store should be the same (not the actual counts,
         #    but what was dropped versus what was held.
@@ -230,10 +228,6 @@ class TaskWindowDescriptor:
         #    of objects that we can determine an isomorphism. I think that we need
         #    to check for this isomorphism between both the stores and the storages
         #    as both relations are used by the fusion analysis.
-        # 5) TODO (rohany): Have to also check for all stores that are futures with immediate values
-        #    (like inline constants, not futures returned from other tasks), that those futures are the same.
-        #    ACTUALLY, i think this is fine. That store will get added as input to the task as normal, and
-        #    things will be OK since we know that it's a future, and we generate code that loads from the future!
 
         # Record a list of task IDs in the buffer.
         self.task_ids = []
@@ -323,9 +317,9 @@ class TaskWindowDescriptor:
                self.storage_generic_ids == other.storage_generic_ids
 
 
-# TODO (rohany): The idea here is to aggregate as much information as we need to be able
-#  to map from the original tasks and partitioning scheme onto the new task and stores
-#  for the fused task.
+# The idea here is to aggregate as much information as we need to be able
+# to map from the original tasks and partitioning scheme onto the new task and stores
+# for the fused task.
 class FusedTaskConstructionDescriptor:
     def __init__(
             self,
