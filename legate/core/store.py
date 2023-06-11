@@ -1802,7 +1802,16 @@ class ExternalStoreReference:
     def __getattr__(self, item):
         result = getattr(self._base, item)
         if callable(result):
-            result = ExternalStoreReference._store_result_wrapper(result)
+            # There is a bit of absurdity that we have to handle here if callable(result)
+            # is true. There's a chance that the result is actually a _property_ instead
+            # of a function. In this case, we don't want to wrap the property, as then
+            # it won't be the correct type for downstream operations that may read it.
+            # So we add the check below. Note that we have to do getattr(type()) instead
+            # of getattr() as raw getattr goes through the class, which evaluates the
+            # property. getattr(type()) goes through the type, which doesn't evaluate
+            # the property for us to check.
+            if not isinstance(getattr(type(self._base), item), property):
+                result = ExternalStoreReference._store_result_wrapper(result)
         return result
 
 def external_store_reference_unwrapper_boilerplate(func):
