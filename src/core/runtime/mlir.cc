@@ -950,23 +950,13 @@ mlir::MemRefType buildMemRefType(mlir::MLIRContext* ctx, const CompileTimeStoreD
     if (Promote* promote = dynamic_cast<Promote*>(ptr); promote != nullptr) {
       auto dim = promote->get_extra_dim();
       auto results = affineMap.getResults();
-
-      // We have to handle the case of a single dimension that was promoted
-      // separately, i.e. a scalar store promoted into a multi-dimensional
-      // object separately from the case of just dropping a dimension.
-      if (results.size() == 1) {
-        assert(dim == 0);
-        affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), mlir::getAffineConstantExpr(0, ctx), ctx);
-      } else {
-        // In the standard case, just drop the promoted dimension
-        // from the affine map.
-        llvm::SmallVector<mlir::AffineExpr, 4> newExpr;
-        for (size_t i = 0; i < results.size(); i++) {
-          if (i == dim) continue;
-          newExpr.push_back(results[i]);
-        }
-        affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), newExpr, ctx);
+      // Drop the promoted dimension from the affine map.
+      llvm::SmallVector<mlir::AffineExpr, 4> newExpr;
+      for (size_t i = 0; i < results.size(); i++) {
+        if (i == dim) continue;
+        newExpr.push_back(results[i]);
       }
+      affineMap = mlir::AffineMap::get(affineMap.getNumDims(), affineMap.getNumSymbols(), newExpr, ctx);
     } else if (Shift* shift = dynamic_cast<Shift*>(ptr); shift != nullptr) {
       // Right now, it seems like we don't have to do anything special when a shift
       // transform has been applied, for the following reasons. If any of these reasons
