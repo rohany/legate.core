@@ -476,6 +476,10 @@ class Store {
    * @return false The store cannot have a reduction accesor
    */
   bool is_reducible() const { return reducible_; }
+  /**
+   * @brief Returns the reduction operator being performed on this store.
+   */
+  int32_t redop_id() const { return this->redop_id_; }
 
  public:
   /**
