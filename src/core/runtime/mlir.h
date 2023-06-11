@@ -184,20 +184,6 @@ public:
   static void body(legate::TaskContext& context);
 };
 
-// class TemporaryStorePromotionPass
-//   : public mlir::PassWrapper<TemporaryStorePromotionPass, mlir::OperationPass<mlir::func::FuncOp>> {
-//
-//  public:
-//   TemporaryStorePromotionPass(const std::vector<int64_t>& temporaryStoreIDs,
-//                               const std::map<int64_t, int64_t>& shapeResolutionMapping,
-//                               const std::map<int64_t, int32_t>& storeIDToIndexMapping);
-//   // TODO (rohany): Add in dependent dialect registration?
-//   void runOnOperation() final;
-//  private:
-//   const std::vector<int64_t>& temporaryStoreIDs_;
-//   const std::map<int64_t, int64_t>& shapeResolutionMapping_;
-//   const std::map<int64_t, int32_t>& storeIDToIndexMapping_;
-// };
 // Utility functions for developing MLIR task bodies.
 // TODO (rohany): In the future, maybe these go to a different file.
 
