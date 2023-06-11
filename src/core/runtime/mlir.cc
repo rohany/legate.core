@@ -678,6 +678,7 @@ void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
     std::vector<int64_t> vectorSizes(1, 4);
     mlir::affine::AffineVectorizeOptions options;
     options.vectorSizes = vectorSizes;
+    options.vectorizeReductions = true;
     pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineVectorize(options));
   } else {
     pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineParallelizePass());
