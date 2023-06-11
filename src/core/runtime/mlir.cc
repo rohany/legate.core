@@ -628,7 +628,7 @@ void MLIRModule::escalateIntermediateStorePrivilege(
   auto ctx = runtime->getContext().get();
   mlir::PassManager pm(ctx, this->module_.get()->getName().getStringRef(), mlir::PassManager::Nesting::Implicit);
   mlir::OpPassManager& funcsPM = pm.nest<mlir::func::FuncOp>();
-  funcsPM.addPass(std::make_unique<TemporaryStorePromotionPass>(intermediateStoreOrdinals, ordinalMapping));
+  funcsPM.addPass(std::make_unique<IntermediateStorePrivilegeEscalationPass>(intermediateStoreOrdinals, ordinalMapping));
 
   if (mlir::failed(pm.run(this->module_.get()))) {
     assert(false);
