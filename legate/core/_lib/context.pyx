@@ -306,7 +306,7 @@ cdef class PyMLIRModule:
         cdef int i
         for i in range(len(temporary_store_ordinals)):
           temporary_store_ordinals_[i] = temporary_store_ordinals[i]
-          resolved_shape_ordinals_[i] = resolved_shape_ordinals_[i]
+          resolved_shape_ordinals_[i] = resolved_shape_ordinals[i]
         cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
         self._module.get().promoteTemporaryStores(runtime, temporary_store_ordinals_, resolved_shape_ordinals_)
 
