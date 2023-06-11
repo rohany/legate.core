@@ -27,6 +27,7 @@ from typing import (
 from . import types as ty
 
 from ._legion.util import BufferBuilder
+from ._legion.future import Future
 
 if TYPE_CHECKING:
     from .operation import AutoTask, Task, Operation
@@ -96,88 +97,80 @@ class SupportedStoreTransformsConstraint(FusionConstraint):
 
 # ProducerConsumerViewConstraint checks that if we write to particular
 # view of a store, then we can subsequently only perform reads from that
-# same view of the store.
-# TODO (rohany): Like the partition aliasing checks below, I'm not sure if
-#  we need to have a similar check on partitions.
+# same view of the store. Additionally, if we reduce to a store, we are
+# not allowed to read from it at all. However, we are allowed to continue
+# reducing to different views, as long as the same reduction function is
+# being used. This constraint is waived for futures however, since different
+# views and partitions on futures don't mean anything, as there is no such
+# thing as partial aliasing of futures.
 class ProducerConsumerViewConstraint(FusionConstraint):
     def __init__(self):
-        self._storage_views: Dict[Storage, Store] = {}
-
-    def apply(self, op: Operation, _: Strategy) -> bool:
-        # TODO (rohany): Handle reductions.
-        for input in op.inputs:
-            root = input._storage.get_root()
-            # TODO (rohany): I think we want a deeper check of equality here.
-            if root in self._storage_views and self._storage_views[root] != input:
-                return False
-        for output in op.outputs:
-            root = output._storage.get_root()
-            # TODO (rohany): I think we want a deeper check of equality here.
-            if root in self._storage_views and self._storage_views[root] != output:
-                return False
-            if root not in self._storage_views:
-                self._storage_views[root] = output
-        return True
-
-
-# PartitioningAliasingViewConstraint checks that we do not read from multiple
-# views of the same data while simulateneously writing to one of the views
-# of the data. Reading from multiple views of the data is supported by Legion.
-class PartitionAliasingViewConstraint(FusionConstraint):
-    def __init__(self):
-        self._read_partitions: Dict[Storage, Set[PartitionBase]] = {}
+        self._storage_views: Dict[Storage, Tuple[Store, PartitionBase]] = {}
+        self._storage_reductions: Dict[Storage, Tuple[Store, PartitionBase, int]] = {}
 
     def apply(self, op: Operation, strat: Strategy) -> bool:
-        # TODO (rohany): Handle reductions.
         for input, sym in zip(op.inputs, op._input_parts):
-            # Record this input partition as a read partition of the root.
             root = input._storage.get_root()
-            if root not in self._read_partitions:
-                self._read_partitions[root] = set()
-            self._read_partitions[root].add(strat.get_partition(sym))
+            part = strat.get_partition(sym)
+            # TODO (rohany): I think we want a deeper check of equality here.
+            if root in self._storage_views and self._storage_views[root] != (input, part) and root.kind != Future:
+                return False
+            # We cannot read any stores that are being reduced to.
+            if root in self._storage_reductions:
+                return False
         for output, sym in zip(op.outputs, op._output_parts):
-            # If we write to a particular storage, then this partition
-            # should be the only partition that we are reading from.
             root = output._storage.get_root()
-            if root in self._read_partitions:
-                parts = self._read_partitions[root]
-                if len(parts) > 1:
-                    return False
-                part = next(iter(parts))
-                if part != strat.get_partition(sym):
-                    return False
+            part = strat.get_partition(sym)
+            # TODO (rohany): I think we want a deeper check of equality here.
+            if root in self._storage_views and self._storage_views[root] != (output, part):
+                return False
+            if root not in self._storage_views:
+                self._storage_views[root] = (output, part)
+        for (reduc, redop), sym in zip(op.reductions, op._reduction_parts):
+            root = reduc._storage.get_root()
+            part = strat.get_partition(sym)
+            # TODO (rohany): I think we want a deeper check of equality here.
+            if root in self._storage_reductions and self._storage_reductions[root] != (reduc, part, redop):
+                return False
+            if root not in self._storage_reductions:
+                self._storage_reductions[root] = (reduc, part, redop)
         return True
 
 
-# AliasingReadWriteViewConstraint is similar to PartitionAliasingViewConstraint
-# but checks equivalence at the level of transforms applied to each store. The
-# PartitionBase objects that we read and write to stores with might be the same,
-# but the underlying transforms on each store can cause the final partitions of
-# those stores to be different.
-class AliasingReadWriteViewConstraint(FusionConstraint):
+# ReadAntiDependenceConstraint checks that if we read from multiple different
+# views of a store, we do not write to any of those views. Reading from and
+# writing to only one view of a store is OK.
+class ReadAntiDependenceConstraint(FusionConstraint):
     def __init__(self):
-        self._read_storage_views: Dict[Storage, Set[Store]] = {}
+        self._read_views: Dict[Storage, Set[Store, PartitionBase]] = {}
 
-    def apply(self, op: Operation, _: Strategy) -> bool:
-        # TODO (rohany): Handle reductions.
-        # Just like above, make sure all the views of a particular storage
-        # are recorded, and error out if we write while reading multiple
-        # views of the same storage.
-        for input in op.inputs:
+    def apply(self, op: Operation, strat: Strategy) -> bool:
+        for input, sym in zip(op.inputs, op._input_parts):
             root = input._storage.get_root()
-            if root not in self._read_storage_views:
-                self._read_storage_views[root] = set()
-            self._read_storage_views[root].add(input)
-        for output in op.outputs:
+            part = strat.get_partition(sym)
+            # Record this read view of the root storage.
+            if root not in self._read_views:
+                self._read_views[root] = set()
+            self._read_views[root].add((input, part))
+        for output, sym in zip(op.outputs, op._output_parts):
             root = output._storage.get_root()
-            if root in self._read_storage_views:
-                views = self._read_storage_views[root]
+            part = strat.get_partition(sym)
+            # If we are writing to a view of a particular storage, then this
+            # view should be the only view that we are reading from.
+            if root in self._read_views:
+                views = self._read_views[root]
                 if len(views) > 1:
                     return False
                 view = next(iter(views))
-                # TODO (rohany): I think we want a deeper check of equality here.
-                if view != output:
+                if view != (output, part):
                     return False
+        for reduc, _ in op.reductions:
+            root = reduc._storage.get_root()
+            # We cannot reduce to a store that we are currently reading from.
+            # TODO (rohany): I think there's an interaction here around privilege
+            #  escalation that could lead to sub-optimal fusion.
+            if root in self._read_views:
+                return False
         return True
 
 
@@ -266,8 +259,8 @@ class TaskWindowDescriptor:
                 ScalarArg(arg, dtype).pack(builder)
             self.task_scalar_args.append(bytes(builder.get_string()))
 
-            op_store_inputs, op_store_outputs = [], []
-            op_storage_inputs, op_storage_outputs = [], []
+            op_store_inputs, op_store_outputs, op_store_reducs, op_reduc_redops = [], [], [], []
+            op_storage_inputs, op_storage_outputs, op_storage_reducs = [], [], []
             for store in op.inputs:
                 store_idctr = add_id(store._unique_id, store_idctr, store_ids, op_store_inputs)
                 storage_idctr = add_id(store._storage._unique_id, storage_idctr, storage_ids, op_storage_inputs)
@@ -282,11 +275,21 @@ class TaskWindowDescriptor:
                 self.store_dims.append(store.ndim)
                 # self.store_transforms.append(store.transform)
                 self.store_liveness.append(store.has_external_references())
+            for store, redop in op.reductions:
+                oldLen = len(op_store_reducs)
+                store_idctr = add_id(store._unique_id, store_idctr, store_ids, op_store_reducs)
+                storage_idctr = add_id(store._storage._unique_id, storage_idctr, storage_ids, op_storage_reducs)
+                if oldLen != len(op_store_reducs):
+                    op_reduc_redops.append(redop)
+                self.store_types.append(store.type)
+                self.store_dims.append(store.ndim)
+                # self.store_transforms.append(store.transform)
+                self.store_liveness.append(store.has_external_references())
 
             # Convert the remapped store and storage lists to tuples so that
             # we can hash them later.
-            self.store_generic_ids.append((tuple(op_store_inputs), tuple(op_store_outputs)))
-            self.storage_generic_ids.append((tuple(op_storage_inputs), tuple(op_storage_outputs)))
+            self.store_generic_ids.append((tuple(op_store_inputs), tuple(op_store_outputs), tuple(op_store_reducs), tuple(op_reduc_redops)))
+            self.storage_generic_ids.append((tuple(op_storage_inputs), tuple(op_storage_outputs), tuple(op_storage_reducs)))
 
         # Compute a hash up-front of this descriptor.
         self._hash = hash((
@@ -332,24 +335,28 @@ class FusedTaskConstructionDescriptor:
     ):
         self.taskid = taskid
         self.funcptr = funcptr
-        store_to_orig_pos = {}
 
+        # Maintain a separate mapping for each list, because if the same store
+        # appears in multiple lists a single mapping would become invalid.
+        store_to_orig_pos_inputs, store_to_orig_pos_outputs, store_to_orig_pos_reducs  = {}, {}, {}
         for opidx, op in enumerate(ops):
             for storeidx, store in enumerate(op.inputs):
-                if store._unique_id not in store_to_orig_pos:
-                    store_to_orig_pos[store._unique_id] = (opidx, storeidx)
+                if store._unique_id not in store_to_orig_pos_inputs:
+                    store_to_orig_pos_inputs[store._unique_id] = (opidx, storeidx)
             for storeidx, store in enumerate(op.outputs):
-                if store._unique_id not in store_to_orig_pos:
-                    store_to_orig_pos[store._unique_id] = (opidx, storeidx)
-            # TODO (rohany): Handle reductions.
+                if store._unique_id not in store_to_orig_pos_outputs:
+                    store_to_orig_pos_outputs[store._unique_id] = (opidx, storeidx)
+            for storeidx, (store, _) in enumerate(op.reductions):
+                if store._unique_id not in store_to_orig_pos_reducs:
+                    store_to_orig_pos_reducs[store._unique_id] = (opidx, storeidx)
 
         self.inputs, self.outputs, self.reducs = [], [], []
         for store in inputs:
-            self.inputs.append(store_to_orig_pos[store._unique_id])
+            self.inputs.append(store_to_orig_pos_inputs[store._unique_id])
         for store in outputs:
-            self.outputs.append(store_to_orig_pos[store._unique_id])
+            self.outputs.append(store_to_orig_pos_outputs[store._unique_id])
         for store in reducs:
-            self.reducs.append(store_to_orig_pos[store._unique_id])
+            self.reducs.append(store_to_orig_pos_reducs[store._unique_id])
 
     def build_task(self, ops: List[Task], strategies: List[Strategy]) -> Tuple[Operation, Strategy]:
         # TODO (rohany): Worry about when these ops come from different libraries.
@@ -363,20 +370,20 @@ class FusedTaskConstructionDescriptor:
         fused.add_scalar_arg(self.funcptr, ty.uint64)
 
     def add_stores_to_task(self, fused: AutoTask, ops: List[Task]):
-        # TODO (rohany): Add reductions.
         for opidx, storeidx in self.inputs:
             op = ops[opidx]
             fused.add_input(op.inputs[storeidx])
         for opidx, storeidx in self.outputs:
             op = ops[opidx]
             fused.add_output(op.outputs[storeidx])
+        for opidx, storeidx in self.reducs:
+            op = ops[opidx]
+            fused.add_reduction(*op.reductions[storeidx])
 
     # build_part_sym_mapping assumes that add_stores_to_task has already been called.
     def build_part_sym_mapping(self, fused: AutoTask, ops: List[Task]):
         part_sym_mapping = {}
-        # TODO (rohany): I don't think we need to remap symbols that no longer
-        #  appear in the final set of stores, which is what my original implementation
-        #  is doing. I'm going to try again here and just remap the things that we need.
+        # Remap only the symbols that we are using in the fused task.
         for idx, (opidx, storeidx) in enumerate(self.inputs):
             op = ops[opidx]
             part_sym_mapping[op._input_parts[storeidx]] = fused._input_parts[idx]

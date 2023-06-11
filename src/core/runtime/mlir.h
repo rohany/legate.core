@@ -112,7 +112,10 @@ class MLIRModule {
     void lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code);
     void dump(MLIRRuntime* runtime);
 
-    // TODO (rohany): Comment...
+    // promoteTemporaryStores rewrites the MLIR module to promote the store
+    // argument ordinals in temporaryStoreOrdinals into local allocations
+    // instead of function arguments. Each store's shape is resolved with
+    // the resolutionOrdinalMapping.
     void promoteTemporaryStores(
       MLIRRuntime* runtime,
       const std::vector<int32_t>& temporaryStoreOrdinals,
@@ -129,6 +132,17 @@ class MLIRModule {
       const std::vector<int32_t>& intermedateStoreOrdinals,
       const std::vector<int32_t>& ordinalMapping
     );
+
+    // normalizeMemrefs normalizes all memref accesses within the
+    // MLIR module. Notably, it does not just call the normalizeMemrefs
+    // operation in MLIR. Because task bodies rely on the shapes of
+    // stores after transformation, the standard rewriting pass can
+    // result in dangling or incorrect dimension operations. This pass
+    // also rewrites the module to explictly take in arrays that hold
+    // the pre-normalization dimensions of all stores. Any passes that
+    // change the function header of the module applied after this pass
+    // must be aware of this fact, and change the module accordingly.
+    void normalizeMemrefs(MLIRRuntime* runtime);
 
     // TODO (rohany): Run a couple passes on this module. In the future this
     //  will be opt in by different libraries, but for now we'll just have

@@ -103,6 +103,7 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
         void register_variant(string, int, legate_core_variant_t)
 
     cdef cppclass MLIRModule:
+        void normalizeMemrefs(MLIRRuntime*)
         void optimize(MLIRRuntime*, legate_core_variant_t)
         void lowerToLLVMDialect(MLIRRuntime*, legate_core_variant_t)
         uintptr_t jitToLLVM(MLIRRuntime*)
@@ -238,6 +239,10 @@ cdef class PyMLIRModule:
     def lowerToLLVMDialect(self, int variantCode):
         runtime = Runtime.get_runtime().getMLIRRuntime()
         self._module.get().lowerToLLVMDialect(runtime, cython.cast(legate_core_variant_t, variantCode))
+
+    def normalizeMemrefs(self) -> None:
+        cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()
+        self._module.get().normalizeMemrefs(runtime)
 
     def optimize(self, int variantCode) -> None:
         cdef MLIRRuntime* runtime = Runtime.get_runtime().getMLIRRuntime()

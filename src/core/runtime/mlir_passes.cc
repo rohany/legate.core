@@ -123,35 +123,38 @@ void IntermediateStorePrivilegeEscalationPass::runOnOperation() {
   mlir::func::FuncOp op = this->getOperation();
   auto& entryBlock = op.getBlocks().front();
   auto numArgs = entryBlock.getNumArguments();
+  // Since we run this pass after memref normalization, we have to also
+  // consider the dimension memrefs that are packaged with the function.
+  // Since every store has a dimension memref, there are always 2n arguments
+  // to the function, where n is the number of stores.
+  auto numStoreArgs = numArgs / 2;
   auto loc = mlir::NameLoc::get(mlir::StringAttr::get(&ctx, "intermediateStorePrivilegeEscalation"));
   mlir::OpBuilder builder(&ctx);
 
-  std::vector<mlir::Value> intermediateStores(this->intermediateOrdinals_.size());
-  std::vector<mlir::Value> resolvedStores(this->ordinalMapping_.size());
+  // Replace uses of the escalated ordinals with the remapped ordinal.
   llvm::BitVector argsToDelete(numArgs);
   for (size_t i = 0; i < this->intermediateOrdinals_.size(); i++) {
-    intermediateStores[i] = entryBlock.getArgument(this->intermediateOrdinals_[i]);
-    resolvedStores[i] = entryBlock.getArgument(this->ordinalMapping_[i]);
+    // Mark each intermediate memref and its dimension array for deletion.
     argsToDelete.set(this->intermediateOrdinals_[i]);
-  }
+    argsToDelete.set(this->intermediateOrdinals_[i] + numStoreArgs);
 
-  // Replace uses of the escalated ordinals with the remapped ordinal.
-  for (size_t i = 0; i < intermediateStores.size(); i++) {
-    auto intermediate = intermediateStores[i];
-    auto resolved = resolvedStores[i];
+    // Replace all uses of the intermediate memref with the resolved memref.
+    auto intermediate = entryBlock.getArgument(this->intermediateOrdinals_[i]);
+    auto resolved = entryBlock.getArgument(this->ordinalMapping_[i]);
     intermediate.replaceAllUsesWith(resolved);
+
+    // Also replace all uses of the intermediate dimension memref with
+    // the resolved dimension memref.
+    auto intermediateDim = entryBlock.getArgument(this->intermediateOrdinals_[i] + numStoreArgs);
+    auto resolvedDim = entryBlock.getArgument(this->ordinalMapping_[i] + numStoreArgs);
+    intermediateDim.replaceAllUsesWith(resolvedDim);
   }
   entryBlock.eraseArguments(argsToDelete);
 
   // Finally adjust the function type to exclude the replaced arguments.
   llvm::SmallVector<mlir::Type, 8> newArgTypes;
-  std::set<int32_t> tempOrdinals(this->intermediateOrdinals_.begin(), this->intermediateOrdinals_.end());
-  size_t idx = 0;
-  for (size_t i = 0; i < numArgs; i++) {
-    if (tempOrdinals.count(idx) == 0) {
-      newArgTypes.push_back(op.getArgumentTypes()[i]);
-    }
-    idx++;
+  for (size_t i = 0; i < entryBlock.getNumArguments(); i++) {
+    newArgTypes.push_back(entryBlock.getArgument(i).getType());
   }
   auto newFuncType = builder.getFunctionType(newArgTypes, std::nullopt);
   op.setFunctionType(newFuncType);

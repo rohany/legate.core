@@ -71,10 +71,9 @@ from .fusion import (
     AutoTaskConstraint,
     MLIRVariantConstraint,
     MachineConstraint,
-    PartitionAliasingViewConstraint,
+    ReadAntiDependenceConstraint,
     ProducerConsumerViewConstraint,
     SupportedStoreTransformsConstraint,
-    AliasingReadWriteViewConstraint,
     generate_mlir_modules,
     construct_store_calling_convention,
 )
@@ -1411,7 +1410,6 @@ class Runtime:
         strategies: List[Strategy],
         pending_ops: List[Operation]
     ) -> Tuple[Operation, Strategy]:
-        from ._legion.util import BufferBuilder
         # TODO (rohany): Have to change this to ask for
         #  feedback from the generated tasks, whether they can
         #  target the same task variants or not etc.
@@ -1474,10 +1472,6 @@ class Runtime:
             ######### Temporary Elimination
 
             # 1) Demote temporary stores to allocations local to task bodies.
-            # TODO (rohany): Brainstorming stuff here ....
-            #  * We can demote temporary stores that are not the input to
-            #    the first task in our fused buffer, and are not the output
-            #    or reduction of the final task in our buffer.
             #  * The temporary store needs to also have a "locally computable"
             #    set of dimensions (shape). The rules for this around unbound stores are
             #    unclear for now, so we can punt that to later. The definition
@@ -1490,6 +1484,8 @@ class Runtime:
             #  * A store is temporary if it has no external references and is not
             #    read by any operations remaining in the unfused portion of the
             #    buffer at the time of fusion.
+            #  * A store is temporary if it has been written to by at least one operation
+            #    in the fused buffer before it is read.
 
             # As a first pass at computing resolved shapes for temporary allocations,
             # let's first make a structure of all stores using the same partitioning.
@@ -1503,11 +1499,18 @@ class Runtime:
                 same_partitions[part].add(store)
                 if store not in store_parts:
                     store_parts[store] = part
+            # Reduction stores are never temporary, so we cannot eliminate them.
+            # We don't include futures in the partition equivalence classes because
+            # they will always have the REPLICATE partition, and thus can lead to
+            # region-backed stores being resolved incorrectly to futures.
             for op, strategy in zip(ops, strategies):
-                # TODO (rohany): Deal with reductions.
                 for input, sym in zip(op.inputs, op._input_parts):
+                    if input._storage.kind is Future:
+                        continue
                     add_partition(input, strategy.get_partition(sym))
                 for output, sym in zip(op.outputs, op._output_parts):
+                    if output._storage.kind is Future:
+                        continue
                     add_partition(output, strategy.get_partition(sym))
 
             # Now find the temporary stores.
@@ -1542,37 +1545,32 @@ class Runtime:
                 for output in op.outputs:
                     killed_pending_storages.add(output._storage._unique_id)
 
+            # We also ensure that futures can never be temporary stores. This is due
+            # to the fact that we allow aliasing views of futures to be fused together.
+            # Because of this, a write to a future may propagate through memory, rather
+            # than standard control flow that the temporary promotion pass uses to
+            # reason about. This is not a major restriction, as future data is constant
+            # size and always hoisted outside of loops, so not much is lost by eliminating
+            # temporary futures.
             for store in new_inputs:
-                if not store.has_external_references() and store._storage._unique_id in defined_storages:
+                if not store.has_external_references() and \
+                       store._storage._unique_id in defined_storages and \
+                       store._storage.kind is not Future:
                     temporaries.append(store)
                     temporary_store_ordinals.append(index)
                 else:
                     durable_inputs.append(store)
                 index += 1
             for store in new_outputs:
-                if not store.has_external_references() and store._storage._unique_id not in read_pending_storages:
+                if not store.has_external_references() and \
+                       store._storage._unique_id not in read_pending_storages and \
+                       store._storage.kind is not Future:
                     temporaries.append(store)
                     temporary_store_ordinals.append(index)
                 else:
                     durable_outputs.append(store)
                 index += 1
-            # TODO (rohany): I don't actually think reduction stores can be temporary?
-            # for store in new_reducs:
-            #     if not store.has_external_references():
-            #         temporaries.append(store)
-            #         temporary_store_ordinals.append(index)
-            #     else:
-            #         durable_reducs.append(store)
-            #     index += 1
             new_inputs, new_outputs = durable_inputs, durable_outputs
-
-            store_id_to_index_mapping = {}
-            index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
-            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                store_id_to_index_mapping[store._unique_id] = index
-                index += 1
 
             # For each of the temporary stores, find a store that can be used to infer
             # the shape of the local allocation. For now, this just means finding
@@ -1587,7 +1585,27 @@ class Runtime:
 
             fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
 
+            # Recompute the store_id_to_index_mapping after we have eliminated temporaries.
+            store_id_to_index_mapping = {}
+            index = 0
+            # TODO (rohany): Haven't yet handled when the same store appears in
+            #  both the inputs and outputs here.
+            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
+                store_id_to_index_mapping[store._unique_id] = index
+                index += 1
+
             ######### Done Temporary Elimination
+
+            # It is extremely unfortunate that normalization of memrefs for
+            # transform inversion has to happen before privilege escalation.
+            # The intermediate escalation pass remaps possible different views
+            # of futures onto the same future with an escalated privilege. In
+            # order for the generated IR to be semantically correct, the mappings
+            # between stores need to have the same dimensionality. Therefore,
+            # we must normalize away transforms on stores. The consequence of this
+            # is that passes applied after noramlization must handle and manage the
+            # auxiliary dimension tracking stores that normalization adds.
+            fused.normalizeMemrefs()
 
             ######### Intermediate store privilege escalation pass
 
@@ -1630,10 +1648,19 @@ class Runtime:
             resolved_input_indexes = []
             for input in intermediates:
                 # TODO (rohany): We can accelerate this search later.
+                # Different views of a future need to be remapped to the same underlying
+                # storage. This is slightly different than regions, because we allow "aliasing"
+                # futures to pass the constraint checker, while multiple read-write views of
+                # regions are not allowed.
                 for i, store in enumerate(new_outputs):
-                    if store._unique_id == input._unique_id:
-                        resolved_input_indexes.append(i + len(new_inputs))
-                        break
+                    if store._storage.kind is Future and input._storage.kind is Future:
+                        if store._storage._unique_id == input._storage._unique_id:
+                            resolved_input_indexes.append(i + len(new_inputs))
+                            break
+                    else:
+                        if store._unique_id == input._unique_id:
+                            resolved_input_indexes.append(i + len(new_inputs))
+                            break
 
             new_inputs = inputs_after_intermediate_promotion
             fused.escalateIntermediateStorePrivilege(intermediate_input_indexes, resolved_input_indexes)
@@ -1653,8 +1680,6 @@ class Runtime:
             fused.optimize(target_variant)
 
             ######### Done standard pass application
-
-            # fused.dump()
 
             # TODO (rohany): At this point, all of the analysis being done to the
             #  task should be finished.
@@ -1741,8 +1766,7 @@ class Runtime:
             constraintMgr.register_constraint(SupportedStoreTransformsConstraint())
             constraintMgr.register_constraint(MachineConstraint())
             constraintMgr.register_constraint(ProducerConsumerViewConstraint())
-            constraintMgr.register_constraint(PartitionAliasingViewConstraint())
-            constraintMgr.register_constraint(AliasingReadWriteViewConstraint())
+            constraintMgr.register_constraint(ReadAntiDependenceConstraint())
             fusablePrefix = constraintMgr.compute_fusable_prefix(ops, strategies, generate_new_strategy)
             self._fusion_logger.info(f"Fusing {fusablePrefix} tasks out of a buffer of {len(ops)}.")
 
