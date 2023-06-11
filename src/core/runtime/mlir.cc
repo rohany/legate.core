@@ -741,52 +741,61 @@ void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCod
   }
 }
 
-template<typename ACC, typename T, int N>
-StridedMemRefType<T, N> accessorToMemRef(ACC acc, Legion::Rect<N> bounds) {
-  StridedMemRefType<T, N> memref{};
+// accessorToMemRef converts a Legion accessor into an MLIR
+// strided memref. It is templated on both the dimension of
+// the resulting memref, and the dimension of the accessor,
+// which may be different in cases when the store underlying
+// the accessor is a zero-dimensional future.
+template<typename ACC, typename T, int MEM_DIM, int ACC_DIM>
+StridedMemRefType<T, MEM_DIM> accessorToMemRef(ACC acc, Legion::Rect<ACC_DIM> bounds) {
+  StridedMemRefType<T, MEM_DIM> memref{};
 
   auto base = acc.ptr(bounds.lo);
   memref.basePtr = const_cast<T*>(base);
   memref.data = const_cast<T*>(base);
   memref.offset = 0;
-  for (int i = 0; i < N; i++) {
-    memref.sizes[i] = bounds.hi[i] - bounds.lo[i] + 1;
-    memref.strides[i] = acc.accessor.strides[i] / sizeof(T);
+  if constexpr (MEM_DIM > 0) {
+    for (int i = 0; i < MEM_DIM; i++) {
+      memref.sizes[i] = bounds.hi[i] - bounds.lo[i] + 1;
+      memref.strides[i] = acc.accessor.strides[i] / sizeof(T);
+    }
   }
   return memref;
 }
 
+// AccessorToMemrefDescAlloc is a functor that is passed through
+// to the type and double dispatch functions to convert a store
+// into an MLIR memref. Using a default template argument for DIM
+// allows us to use this functor in both type and double dispatch.
 struct AccessorToMemrefDescAlloc {
-  template<Type::Code CODE, int DIM>
-  void* operator()(const Store& store, bool read) {
+  template<Type::Code CODE, int DIM = 0>
+  void* operator()(const Store& store) {
     using T = legate_type_of<CODE>;
     StridedMemRefType<T, DIM> memref;
-    if (read) {
-      auto acc = store.read_accessor<T, DIM>();
-      memref = accessorToMemRef<decltype(acc), T, DIM>(acc, store.shape<DIM>());
+    constexpr int ACC_DIM = DIM == 0 ? 1 : DIM;
+    if (store.is_readable()) {
+      auto acc = store.read_accessor<T, ACC_DIM>();
+      memref = accessorToMemRef<decltype(acc), T, DIM, ACC_DIM>(acc, store.shape<ACC_DIM>());
+    } else if (store.is_writable()) {
+      auto acc = store.write_accessor<T, ACC_DIM>();
+      memref = accessorToMemRef<decltype(acc), T, DIM, ACC_DIM>(acc, store.shape<ACC_DIM>());
     } else {
-      auto acc = store.write_accessor<T, DIM>();
-      memref = accessorToMemRef<decltype(acc), T, DIM>(acc, store.shape<DIM>());
+      assert(store.is_reducible());
+      auto redop = store.redop_id();
+      switch (static_cast<ReductionOpKind>(store.redop_id())) {
+        case ReductionOpKind::ADD: {
+          // Since we're going to access the raw pointer underlying this accessor anyway
+          // in the generated code, it doesn't matter what the exclusivity mode we give
+          // to this accessor is.
+          auto acc = store.reduce_accessor<SumReduction<T>, true /* exclusive */, ACC_DIM>();
+          memref = accessorToMemRef<decltype(acc), T, DIM, ACC_DIM>(acc, store.shape<ACC_DIM>());
+          break;
+        }
+        default:
+          assert(false);
+      }
     }
     auto argPtr = static_cast<StridedMemRefType<T, DIM>*>(malloc(sizeof(decltype(memref))));
-    *argPtr = memref;
-    return argPtr;
-  }
-};
-
-struct FutureToMemrefDescAlloc {
-  template<Type::Code CODE>
-  void* operator()(const Store& store, bool read) {
-    using T = legate_type_of<CODE>;
-    StridedMemRefType<T, 1> memref;
-    if (read) {
-      auto acc = store.read_accessor<T, 1>();
-      memref = accessorToMemRef<decltype(acc), T, 1>(acc, store.shape<1>());
-    } else {
-      auto acc = store.write_accessor<T, 1>();
-      memref = accessorToMemRef<decltype(acc), T, 1>(acc, store.shape<1>());
-    }
-    auto argPtr = static_cast<StridedMemRefType<T, 1>*>(malloc(sizeof(decltype(memref))));
     *argPtr = memref;
     return argPtr;
   }
@@ -799,7 +808,6 @@ void MLIRTask::body(TaskContext& context) {
   auto& reducs = context.reductions();
   auto& scalars = context.scalars();
 
-  assert(reducs.size() == 0);
   // TODO (rohany): Not handling the calling convention of applications
   //  passing scalars to the tasks yet.
   assert(scalars.size() == 1);
@@ -814,11 +822,11 @@ void MLIRTask::body(TaskContext& context) {
   llvm::SmallVector<void*, 8> dimDatas;
   llvm::SmallVector<void*, 8> dimArgData;
   // Pack all of the inputs and outputs into Memref types.
-  auto addStoreToArgs = [&](Store& store, bool read) {
-    // TODO (rohany): Comment...
+  auto addStoreToArgs = [&](Store& store) {
+    // Along with each store, also collect the descriptor for the memref that
+    // will hold the dimensions of the memref.
     {
       StridedMemRefType<int64_t, 1> memref{};
-
       auto data = (int64_t*)malloc(sizeof(int64_t) * store.dim());
       memref.basePtr = data;
       memref.data = data;
@@ -829,49 +837,39 @@ void MLIRTask::body(TaskContext& context) {
       for (int i = 0; i < store.dim(); i++) {
         data[i] = dom.hi()[i] - dom.lo()[i] + 1;
       }
-
       auto argPtr = (StridedMemRefType<int64_t, 1>*)malloc(sizeof(StridedMemRefType<int64_t, 1>));
       *argPtr = memref;
       dimDatas.push_back(data);
       dimArgData.push_back(argPtr);
     }
+
+    // Remove all transforms from the store before constructing the memref type.
     while (store.transformed()) {
       store.remove_transform();
     }
     void* argPtr = nullptr;
     if (store.is_future()) {
-      argPtr = type_dispatch(store.code(), FutureToMemrefDescAlloc{}, store, read);
+      argPtr = type_dispatch(store.code(), AccessorToMemrefDescAlloc{}, store);
     } else {
-      argPtr = double_dispatch(store.dim(), store.code(), AccessorToMemrefDescAlloc{}, store, read);
+      argPtr = double_dispatch(store.dim(), store.code(), AccessorToMemrefDescAlloc{}, store);
     }
     argData.push_back(argPtr);
   };
 
-  for (auto& store : inputs) {
-    addStoreToArgs(store, true);
-  }
-  for (auto& store : outputs) {
-    addStoreToArgs(store, false);
-  }
-  for (auto arg : dimArgData) {
-    argData.push_back(arg);
-  }
+  for (auto& store : inputs) { addStoreToArgs(store); }
+  for (auto& store : outputs) { addStoreToArgs(store); }
+  for (auto& store : reducs) { addStoreToArgs(store); }
+  for (auto arg : dimArgData) { argData.push_back(arg); }
 
   llvm::SmallVector<void*, 8> args;
-  for (size_t i = 0; i < argData.size(); i++) {
-    args.push_back(&argData[i]);
-  }
+  for (size_t i = 0; i < argData.size(); i++) { args.push_back(&argData[i]); }
 
+  // Actually invoke the generated code.
   (*func)(args.data());
 
-  for (auto it : dimDatas) {
-    free(it);
-  }
-
   // Free everything after the body executes.
-  for (auto it : argData) {
-    free(it);
-  }
+  for (auto it : dimDatas) { free(it); }
+  for (auto it : argData) { free(it); }
 }
 
 mlir::Type coreTypeToMLIRType(mlir::MLIRContext* ctx, Type::Code typ) {
