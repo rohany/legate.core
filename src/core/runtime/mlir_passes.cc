@@ -73,7 +73,9 @@ void TemporaryStorePromotionPass::runOnOperation() {
     // is indeed a memref type.
     auto temporary = temporaryStores[i];
     auto resolved = resolvedStores[i];
+    auto temporaryType = mlir::cast<mlir::MemRefType>(temporary.getType());
     auto resolvedType = mlir::cast<mlir::MemRefType>(resolved.getType());
+    assert(temporaryType.getRank() == resolvedType.getRank());
     auto dim = resolvedType.getRank();
     llvm::SmallVector<mlir::Value, 4> dims;
     for (size_t d = 0; d < dim; d++) {
@@ -84,13 +86,10 @@ void TemporaryStorePromotionPass::runOnOperation() {
     // Finally eliminate the argument in favor of the local allocation.
     temporary.replaceAllUsesWith(newTemp);
 
-    // TODO (rohany): Comment this up / implement it.
-
-    // TODO (rohany): Get all of the uses of the new temporary that are a dim op.
-    // TODO (rohany): For each use, get the dim op, get the constant, turn it into
-    //  an integer, and then replace the use of the entire op with the corresponding
-    //  dim op in the above vector.
-
+    // Forward all dimension operations on the temporary store to
+    // the corresponding dimension operation on the forwarded store.
+    // We don't want dimension operations on the temporaries laying
+    // around because we want to encourage deletion of the temporaries.
     for (mlir::Operation* user : newTemp->getUsers()) {
       if (!mlir::isa<mlir::memref::DimOp>(user)) { continue; }
       mlir::memref::DimOp dimOp = mlir::cast<mlir::memref::DimOp>(user);
@@ -107,27 +106,11 @@ void TemporaryStorePromotionPass::runOnOperation() {
 
   // Finally adjust the function type to exclude the replaced arguments.
   llvm::SmallVector<mlir::Type, 8> newArgTypes;
-  std::set<int32_t> tempOrdinals(this->temporaryStoreOrdinals_.begin(), this->temporaryStoreOrdinals_.end());
-  size_t idx = 0;
-  for (size_t i = 0; i < numArgs; i++) {
-    if (tempOrdinals.count(idx) == 0) {
-      newArgTypes.push_back(originalTypes[i]);
-    }
-    idx++;
+  for (size_t i = 0; i < entryBlock.getNumArguments(); i++) {
+    newArgTypes.push_back(entryBlock.getArgument(i).getType());
   }
   auto newFuncType = builder.getFunctionType(newArgTypes, std::nullopt);
   op.setFunctionType(newFuncType);
-
-  // TODO (rohany): We have to see what data structures are needed here,
-  //  but this pass needs to do:
-  //  1) Remove the arguments corresponding to temporary stores.
-  //  2) For each removed temporary store, rewrite it as an allocation
-  //     by matching it against a freshly allocated store with the dimensions
-  //     of the store the temporary has been remapped to.
-
-  // TODO (rohany): I think that I want to change the arguments here so that we
-  //  are just dealing with argument ordinals, rather than store IDs, as the MLIR
-  //  pass at this point has no concept of store IDs.
 }
 
 IntermediateStorePrivilegeEscalationPass::IntermediateStorePrivilegeEscalationPass(
