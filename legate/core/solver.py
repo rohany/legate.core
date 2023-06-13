@@ -14,6 +14,7 @@
 #
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Generic, List, Optional, Tuple, TypeVar
 
 from . import FieldSpace, Future, Rect
@@ -235,6 +236,9 @@ class Strategy:
             assert(sym not in self._key_parts)
             self._key_parts.add(sym)
         self._eq_classes.union(other._eq_classes)
+
+    def clone(self):
+        return copy.copy(self)
 
     def __str__(self) -> str:
         st = "[Strategy]"

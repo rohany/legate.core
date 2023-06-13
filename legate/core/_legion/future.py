@@ -17,13 +17,18 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .. import ffi, legion
-from .geometry import Point, Rect
+from .geometry import Domain, Point, Rect
 from .pending import _pending_deletions
 
 
 class Future:
     def __init__(
-        self, handle: Optional[Any] = None, type: Optional[Any] = None
+        self,
+        handle: Optional[Any] = None,
+        type: Optional[Any] = None,
+        # Futures may also be replicated, meaning they are backed instead by
+        # a FutureMap in which all points contain the same value.
+        replicated_map: FutureMap = None,
     ) -> None:
         """
         A Future object represents a pending computation from a task or other
@@ -38,8 +43,40 @@ class Future:
         type : object
             Optional object to represent the type of this future
         """
-        self.handle = handle
+        self._handle = handle
         self._type = type
+
+        # Local data structures managing replicated futures.
+        self._replicated_map = replicated_map
+        self._replicated_map_domain = None
+
+    @property
+    def handle(self) -> Optional[Any]:
+        # Trying to explicitly get a handle from a replicated future
+        # will collapse the replicated map into the first future.
+        if self._replicated_map is None:
+            return self._handle
+        if self._replicated_map is not None and self._handle is None:
+            domain = self.replicated_map_domain
+            point = domain.rect.lo
+            self._handle = legion.legion_future_map_get_future(
+                self._replicated_map.handle, point.raw()
+            )
+        return self._handle
+
+    @property
+    def replicated(self) -> bool:
+        return self._replicated_map is not None
+
+    @property
+    def replicated_map_domain(self) -> Domain:
+        assert(self.replicated)
+        if self._replicated_map_domain is not None:
+            return self._replicated_map_domain
+        self._replicated_map_domain = Domain(
+            legion.legion_future_map_get_domain(self._replicated_map.handle)
+        )
+        return self._replicated_map_domain
 
     def __del__(self) -> None:
         self.destroy(unordered=True)
@@ -67,13 +104,18 @@ class Future:
             Whether this Future is being destroyed outside of the scope
             of the execution of a Legion task or not
         """
-        if self.handle is None:
+        if self.handle is None and self._replicated_map is None:
             return
-        if unordered:
-            _pending_deletions.append((self.handle, type(self)))
-        else:
-            legion.legion_future_destroy(self.handle)
-        self.handle = None
+
+        if self.handle is not None:
+            if unordered:
+                _pending_deletions.append((self.handle, type(self)))
+            else:
+                legion.legion_future_destroy(self.handle)
+
+        self._handle = None
+        self._replicated_handle = None
+        self._replicated_map_domain = None
 
     def set_value(
         self,
@@ -94,9 +136,9 @@ class Future:
         type : object
             An optional object to represent the type of the future
         """
-        if self.handle is not None:
+        if self.handle is not None or self._replicated_map is not None:
             raise RuntimeError("Future must be unset to set its value")
-        self.handle = legion.legion_future_from_untyped_pointer(
+        self._handle = legion.legion_future_from_untyped_pointer(
             runtime, ffi.from_buffer(data), size
         )
         self._type = type

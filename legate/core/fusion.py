@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -76,6 +77,59 @@ class MachineConstraint(FusionConstraint):
             return True
         else:
             return self._machine == op.target_machine
+
+
+class LaunchSpaceEquivalenceConstraint(FusionConstraint):
+    def __init__(self):
+        self._launch_space = None
+        self._launch_space_set = False
+        self._single_ops = []
+
+    # A single operation is promotable if all of the operands are futures.
+    def is_single_op_promotable(self, op: Operation) -> bool:
+        if len(op.reductions) > 0:
+            # I can't imagine any single tasks launched with reduction
+            # privilege. If I see this, I'm keeping the assert around
+            # to investigate that operation more.
+            assert(False)
+            return False
+        return all(s._storage.kind is Future for s in chain(op.inputs, op.outputs))
+
+    def apply(self, op: Operation, strat: Strategy) -> bool:
+        # We can always accept the first seen operation.
+        if not self._launch_space_set:
+            self._launch_space = strat.launch_domain
+            self._launch_space_set = True
+            return True
+
+        # Maintain all of the single operations seen while the
+        # launch space is None, since we need to check that all
+        # of these operations are promotable in case we promote
+        # the launch space to a non-None value.
+        if self._launch_space is None and strat.launch_domain is None:
+            self._single_ops.append(op)
+
+        # Attempt to promote all previously seen single operations into
+        # the new launch space.
+        if self._launch_space is None and strat.launch_domain is not None:
+            # If we are switching from a None to a non-None launch domain, all
+            # of the operations we've seen so far with None launch domains must
+            # be promotable.
+            if all([self.is_single_op_promotable(op) for op in self._single_ops]):
+                self._launch_space = strat.launch_domain
+                return True
+            else:
+                return False
+
+        # If we are maintaining a non-null launch space and see an
+        # operation that isn't partitioned, see if that operation can
+        # be promoted.
+        if self._launch_space is not None and strat.launch_domain is None:
+            return self.is_single_op_promotable(op)
+
+        # Finally, just return if the launch spaces are equal at this point,
+        # because either both are None or both are a shape.
+        return self._launch_space == strat.launch_domain
 
 
 # SupportedStoreTransformsConstraints ensures that all stores
@@ -396,10 +450,32 @@ class FusedTaskConstructionDescriptor:
         return part_sym_mapping
 
     def build_new_strategy(self, fused: AutoTask, ops: List[Task], strategies: List[Strategy]):
-        # Merge all of the individual stratgies into a single strategy.
-        new_strat = strategies[0]
+        # As part of building the new strategy, we promote single tasks into
+        # the launch domain of everything else in the buffer. Because of the
+        # launch constraint applied earlier, we know that all tasks are
+        # indeed promotable.
+        launch_domains = list(set(s.launch_domain for s in strategies if s.launch_domain is not None))
+        # Either everything is None, or some are None and everything
+        # else is the same launch domain.
+        assert(len(launch_domains) == 1 or len(launch_domains) == 0)
+        merged_launch_domain = launch_domains[0] if len(launch_domains) == 1 else None
+
+        def adjust_launch_domain(strat: Strategy):
+            # If we're doing a single task launch where all of the
+            # launch domains are None, then no strategy modification
+            # needs to be done.
+            if merged_launch_domain is None:
+                return strat
+            if strat.launch_domain is None:
+                new_strat = strat.clone()
+                new_strat._launch_domain = merged_launch_domain
+                return new_strat
+            return strat
+
+        # Merge all of the individual strategies into a single strategy.
+        new_strat = adjust_launch_domain(strategies[0])
         for strat in strategies[1:]:
-            new_strat.merge(strat)
+            new_strat.merge(adjust_launch_domain(strat))
         # Remap all of the needed symbols over to the new symbols.
         return new_strat.remap(self.build_part_sym_mapping(fused, ops))
 

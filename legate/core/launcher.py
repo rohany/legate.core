@@ -159,6 +159,10 @@ class FutureStoreArg:
         self._read_only = read_only
         self._has_storage = has_storage
         self._redop = redop
+        # We're going to set the _launch_domain argument later because
+        # the way packing works doesn't expose the launch domain at construction
+        # of the FutureStoreArg.
+        self._launch_domain = None
 
     def pack(self, buf: BufferBuilder) -> None:
         self._store.serialize(buf)
@@ -166,6 +170,15 @@ class FutureStoreArg:
         buf.pack_bool(self._read_only)
         buf.pack_bool(self._has_storage)
         buf.pack_32bit_uint(self._store.type.size)
+
+        # Record in the buffer whether this future will be packed in
+        # the first set of futures, or included in the point futures.
+        if self._store._storage._data is not None and self._store._storage.data.replicated:
+            future_domain = self._store._storage.data.replicated_map_domain
+            buf.pack_bool(future_domain.rect == self._launch_domain)
+        else:
+            buf.pack_bool(False)
+
         extents = self._store.extents
         buf.pack_32bit_uint(len(extents))
         for extent in extents:
@@ -210,9 +223,16 @@ class RegionFieldArg:
 def pack_args(
     argbuf: BufferBuilder,
     args: Sequence[LauncherArg],
+    launch_domain: Optional[Rect] = None,
 ) -> None:
     argbuf.pack_32bit_uint(len(args))
     for arg in args:
+        # This is very hacky, but if our argument has the _launch_domain
+        # attribute (i.e. FutureStoreArg), we'll set it so that the pack
+        # function can use it to correctly pack the argument when the
+        # launch domain is known.
+        if hasattr(arg, "_launch_domain") and launch_domain is not None:
+            arg._launch_domain = launch_domain
         arg.pack(argbuf)
 
 
@@ -927,8 +947,27 @@ class TaskLauncher:
         self._req_analyzer.analyze_requirements()
         self._out_analyzer.analyze_requirements()
 
-        pack_args(argbuf, self._inputs)
-        pack_args(argbuf, self._outputs)
+        # Due to the introduction of replicated futures, we have to do
+        # some trickery to properly package future-backed stores into
+        # the task metadata correctly. This is made especially annoying
+        # due to Legion's calling convention for futures: normal futures
+        # appear first in the future list, then followed by all point futures.
+        # So we have to include extra information here about how many future
+        # arguments are stored in each of those lists so that the deserializer
+        # can look in the correct place of the future list when unpacking futures.
+        point_future_store_args, normal_future_store_args = 0, 0
+        for arg in chain(self._inputs, self._outputs, self._reductions):
+            if isinstance(arg, FutureStoreArg):
+                if arg._store._storage._data is not None and \
+                   arg._store._storage.data.replicated and \
+                   arg._store._storage.data.replicated_map_domain.rect == launch_domain:
+                    point_future_store_args += 1
+                else:
+                    normal_future_store_args += 1
+        argbuf.pack_32bit_uint(normal_future_store_args)
+
+        pack_args(argbuf, self._inputs, launch_domain=launch_domain)
+        pack_args(argbuf, self._outputs, launch_domain=launch_domain)
         pack_args(argbuf, self._reductions)
         pack_args(argbuf, self._scalars)
         argbuf.pack_bool(self._can_raise_exception)
@@ -951,7 +990,12 @@ class TaskLauncher:
         for req, fields in self._req_analyzer.requirements:
             req.proj.add(task, req, fields, _index_task_calls)
         for future in self._future_args:
-            task.add_future(future)
+            # If we have a replicated future, then add the replicated future map
+            # as a point future to the index launch.
+            if future.replicated and future.replicated_map_domain.rect == launch_domain:
+                task.add_point_future(ArgumentMap(future_map=future._replicated_map))
+            else:
+                task.add_future(future)
         if self._insert_barrier:
             volume = launch_domain.get_volume()
             arrival, wait = runtime.get_barriers(volume)

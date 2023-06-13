@@ -106,6 +106,12 @@ class TaskDeserializer : public BaseDeserializer<TaskDeserializer> {
   Span<const Legion::Future> futures_;
   Span<const Legion::PhysicalRegion> regions_;
   std::vector<Legion::OutputRegion> outputs_;
+
+  // The TaskDeserializer must maintain indices into the futures list
+  // to disambiguate future arguments that are packed as normal futures
+  // versus those that are packed as point futures.
+  uint32_t futures_index_ = 0;
+  uint32_t point_futures_index_ = 0;
 };
 
 class SimpleDeserializer : public BaseDeserializer<SimpleDeserializer> {
@@ -141,7 +147,10 @@ class TaskDeserializer : public BaseDeserializer<TaskDeserializer> {
   const Legion::Task* task_;
   Legion::Mapping::MapperRuntime* runtime_;
   Legion::Mapping::MapperContext context_;
+
+  // See the comment above on the legate::TaskDeserializer.
   uint32_t future_index_;
+  uint32_t point_futures_index_ = 0;
 };
 
 class CopyDeserializer : public BaseDeserializer<CopyDeserializer> {

@@ -39,6 +39,18 @@ TaskDeserializer::TaskDeserializer(const Legion::Task* task,
   runtime->get_output_regions(ctx, outputs_);
 
   first_task_ = !task->is_index_space || (task->index_point == task->index_domain.lo());
+
+  // Set up the current future and point future indexes. If this is
+  // an index space task launch, then legate also includes the number
+  // of future arguments that are "standard" future arguments, versus
+  // the future arguments packed as point futures. The deserializer
+  // will maintain separate pointers into the futures span to read futures
+  // from the corresponding pieces.
+  this->futures_index_ = 0;
+  if (task->is_index_space) {
+    auto num_normal_future_args = unpack<uint32_t>();
+    this->point_futures_index_ = num_normal_future_args;
+  }
 }
 
 void TaskDeserializer::_unpack(Store& value)
@@ -72,6 +84,7 @@ void TaskDeserializer::_unpack(FutureWrapper& value)
   auto read_only   = unpack<bool>();
   auto has_storage = unpack<bool>();
   auto field_size  = unpack<uint32_t>();
+  auto point_future = unpack<bool>();
 
   auto point = unpack<std::vector<int64_t>>();
   Domain domain;
@@ -83,8 +96,13 @@ void TaskDeserializer::_unpack(FutureWrapper& value)
 
   Legion::Future future;
   if (has_storage) {
-    future   = futures_[0];
-    futures_ = futures_.subspan(1);
+    // Read from and increment the corresponding position whether this
+    // future was packed as a future argument or a point future.
+    if (point_future) {
+      future = this->futures_[this->point_futures_index_++];
+    } else {
+      future = this->futures_[this->futures_index_++];
+    }
   }
 
   value = FutureWrapper(read_only, field_size, domain, future, has_storage && first_task_);
@@ -110,17 +128,18 @@ void TaskDeserializer::_unpack(UnboundRegionField& value)
 
 void TaskDeserializer::_unpack(comm::Communicator& value)
 {
-  auto future = futures_[0];
-  futures_    = futures_.subspan(1);
+  auto future = this->futures_[this->point_futures_index_++];
   value       = comm::Communicator(future);
 }
 
 void TaskDeserializer::_unpack(Legion::PhaseBarrier& barrier)
 {
-  auto future   = futures_[0];
-  futures_      = futures_.subspan(1);
-  auto barrier_ = future.get_result<legion_phase_barrier_t>();
-  barrier       = Legion::CObjectWrapper::unwrap(barrier_);
+  // TODO (rohany): I don't know what the calling convention for phase barriers is?
+  assert(false);
+  // auto future   = futures_[0];
+  // futures_      = futures_.subspan(1);
+  // auto barrier_ = future.get_result<legion_phase_barrier_t>();
+  // barrier       = Legion::CObjectWrapper::unwrap(barrier_);
 }
 
 namespace mapping {
@@ -140,6 +159,12 @@ TaskDeserializer::TaskDeserializer(const Legion::Task* task,
     future_index_(0)
 {
   first_task_ = false;
+
+  // Maintain the same information as the normal TaskDeserializer.
+  if (task->is_index_space) {
+    auto num_normal_future_args = unpack<uint32_t>();
+    this->point_futures_index_ = num_normal_future_args;
+  }
 }
 
 void TaskDeserializer::_unpack(Store& value)
@@ -177,6 +202,7 @@ void TaskDeserializer::_unpack(FutureWrapper& value)
   unpack<bool>();
   unpack<bool>();
   unpack<uint32_t>();
+  auto point_future = unpack<bool>();
 
   auto point = unpack<std::vector<int64_t>>();
   Domain domain;
@@ -186,7 +212,11 @@ void TaskDeserializer::_unpack(FutureWrapper& value)
     domain.rect_data[idx + domain.dim] = point[idx] - 1;
   }
 
-  value = FutureWrapper(future_index_++, domain);
+  if (point_future) {
+    value = FutureWrapper(this->point_futures_index_++, domain);
+  } else {
+    value = FutureWrapper(this->future_index_++, domain);
+  }
 }
 
 void TaskDeserializer::_unpack(RegionField& value, bool is_output_region)

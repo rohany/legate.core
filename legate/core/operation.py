@@ -517,7 +517,6 @@ class Task(TaskProtocol):
             + int(self.can_raise_exception)
         )
         launch_shape = Shape(c + 1 for c in launch_domain.hi)
-        assert num_scalar_outs == 0
 
         if num_all_scalars == 0:
             return
@@ -526,6 +525,12 @@ class Task(TaskProtocol):
                 (output, redop) = self.reductions[self.scalar_reductions[0]]
                 redop_id = output.type.reduction_op_id(redop)
                 output.set_storage(runtime.reduce_future_map(result, redop_id))
+            elif num_scalar_outs == 1:
+                # If we have a scalar output from an index launch, the result must
+                # be a replicated future. In that case, we'll take the future map
+                # directly as the backing replicated_map.
+                output = self.outputs[self.scalar_outputs[0]]
+                output.set_storage(Future(replicated_map=result))
             elif num_unbound_outs == 1:
                 output = self.outputs[self.unbound_outputs[0]]
                 # TODO: need to track partitions for N-D unbound stores
@@ -556,6 +561,13 @@ class Task(TaskProtocol):
                 partition = Weighted(launch_shape, weights)
                 partition.import_partition(out_partitions[output])
                 output.set_key_partition(partition)
+                idx += 1
+            for out_idx in self.scalar_outputs:
+                # Similarly to above, we'll use extract scalar to construct a replicated
+                # future map for the replicated output scalar.
+                output = self.outputs[out_idx]
+                repl_scalar = runtime.extract_scalar_with_domain(result, idx, launch_domain)
+                output.set_storage(Future(replicated_map=repl_scalar))
                 idx += 1
             for red_idx in self.scalar_reductions:
                 (output, redop) = self.reductions[red_idx]

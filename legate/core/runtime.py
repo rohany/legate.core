@@ -69,6 +69,7 @@ from .fusion import (
     FusedTaskConstructionDescriptor,
     FusionConstraintManager,
     AutoTaskConstraint,
+    LaunchSpaceEquivalenceConstraint,
     MLIRVariantConstraint,
     MachineConstraint,
     ReadAntiDependenceConstraint,
@@ -1762,6 +1763,7 @@ class Runtime:
             # TODO (rohany): Can use a singleton for the constraint objects
             #  that don't manipulate internal state.
             constraintMgr.register_constraint(AutoTaskConstraint())
+            constraintMgr.register_constraint(LaunchSpaceEquivalenceConstraint())
             constraintMgr.register_constraint(MLIRVariantConstraint())
             constraintMgr.register_constraint(SupportedStoreTransformsConstraint())
             constraintMgr.register_constraint(MachineConstraint())
