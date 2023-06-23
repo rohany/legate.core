@@ -285,6 +285,12 @@ static void packFunctionArguments(llvm::Module *module) {
     if (interfaceFunctions.count(&func)) {
       continue;
     }
+    // We only need to generate a wrapper for the c-interface
+    // function, which we can check by seeing if the function
+    // name contains "ciface".
+    if (func.getName().find("ciface") == std::string::npos) {
+      continue;
+    }
 
     // Given a function `foo(<...>)`, define the interface function
     // `mlir_foo(i8**)`.
