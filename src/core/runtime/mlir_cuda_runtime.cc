@@ -113,6 +113,21 @@ EXTERNAL_LINKAGE void mgpuStreamSynchronize(CUstream stream) {
   CUDA_REPORT_IF_ERROR(cuStreamSynchronize(stream));
 }
 
+EXTERNAL_LINKAGE void* mgpuMemAlloc(uint64_t sizeBytes, CUstream /*stream*/) {
+  // We'll allocate on deferred buffers separate from the CUDA streams.
+  // This function only handles device-side allocations, so we can always
+  // do GPU_FB_MEM.
+  auto buffer = legate::create_buffer<uint8_t>(sizeBytes, Legion::Memory::Kind::GPU_FB_MEM);
+  return reinterpret_cast<void*>(buffer.ptr(0));
+}
+
+EXTERNAL_LINKAGE void mgpuMemcpy(void *dst, void *src, size_t sizeBytes, CUstream stream) {
+  CUDA_REPORT_IF_ERROR(cuMemcpyAsync(reinterpret_cast<CUdeviceptr>(dst),
+                                     reinterpret_cast<CUdeviceptr>(src),
+                                     sizeBytes,
+                                     stream));
+}
+
 }
 
 
