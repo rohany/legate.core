@@ -689,7 +689,9 @@ void MLIRModule::optimize(MLIRRuntime* runtime, LegateVariantCode code) {
     options.vectorizeReductions = true;
     pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineVectorize(options));
   } else {
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineParallelizePass());
+    mlir::affine::AffineParallelizeOptions options;
+    options.parallelReductions = true;
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineParallelizePass(options));
   }
 
   // Some of the other passes can introduce some extra IR that is easy to
