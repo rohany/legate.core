@@ -26,6 +26,7 @@
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "core/runtime/mlir_passes.h"
 
@@ -296,6 +297,25 @@ void handleJITLookupError(llvm::Expected<llvm::orc::ExecutorAddr>& symbol) {
   llvm::raw_string_ostream os(errorMessage);
   llvm::handleAllErrors(symbol.takeError(),
                         [&os](llvm::ErrorInfoBase &ei) { ei.log(os); });
+}
+
+//===----------------------------------------------------------------------===//
+// TableGen'd rewrite patterns
+//===----------------------------------------------------------------------===//
+
+namespace {
+#include "src/core/runtime/mlir_rewriters.inc"
+} // namespace
+
+ReductionIdentityFoldingPass::ReductionIdentityFoldingPass() {}
+
+void ReductionIdentityFoldingPass::runOnOperation() {
+  mlir::RewritePatternSet patterns(&this->getContext());
+  patterns.add<AddFZeroLHS,
+               AddFZeroRHS,
+               AndIOneLHS,
+               AndIOneRHS>(&this->getContext());
+  (void)mlir::applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 }
 
 }

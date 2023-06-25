@@ -304,6 +304,14 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Found MLIR ${MLIR_PACKAGE_VERSION}")
 message(STATUS "Using MLIR.cmake in: ${MLIR_DIR}")
 
+# Add the LLVM and MLIR cmake directories to get access
+# to the exported cmake functions they contain.
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(TableGen)
+include(AddLLVM)
+include(AddMLIR)
+
 target_include_directories(legate_core PUBLIC ${LLVM_INCLUDE_DIRS})
 target_include_directories(legate_core PUBLIC ${MLIR_INCLUDE_DIRS})
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
@@ -324,6 +332,16 @@ target_link_libraries(legate_core
    MLIRTransforms
    MLIRExecutionEngine
 )
+
+# Include all of the TableGen files used in the implementation.
+set(LLVM_TARGET_DEFINITIONS src/core/runtime/mlir_rewriters.td)
+mlir_tablegen(src/core/runtime/mlir_rewriters.inc -gen-rewriters -I ${MLIR_INCLUDE_DIRS})
+add_public_tablegen_target(mlir_rewriters_inc_gen)
+# We have to explicitly add a dependency on legate_core with this TableGen target.
+add_dependencies(legate_core mlir_rewriters_inc_gen)
+# TableGen generates files in the cmake install directory, so we have
+# to point the include path also there.
+target_include_directories(legate_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 target_include_directories(legate_core
   PUBLIC

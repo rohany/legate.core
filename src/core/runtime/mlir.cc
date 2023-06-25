@@ -371,6 +371,7 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code
     opts.x86Vector = true;
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    pm.addPass(std::make_unique<ReductionIdentityFoldingPass>());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertSCFToCFPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createExpandStridedMetadataPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
@@ -385,6 +386,7 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code
 #ifdef LEGATE_USE_OPENMP
     // TODO (rohany): I need to get this to work with vectorization too.
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    pm.addPass(std::make_unique<ReductionIdentityFoldingPass>());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
     pm.addPass(mlir::createConvertSCFToOpenMPPass());
     pm.addPass(mlir::createConvertOpenMPToLLVMPass());
@@ -399,6 +401,7 @@ void MLIRModule::lowerToLLVMDialect(MLIRRuntime* runtime, LegateVariantCode code
   } else if (code == LegateVariantCode::LEGATE_GPU_VARIANT) {
 #ifdef LEGATE_USE_CUDA
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
+    pm.addPass(std::make_unique<ReductionIdentityFoldingPass>());
     // In order to schedule loops of arbitrary dimensions onto GPUs, we first run
     // the canonicalizer pass, which collects nested for-loops into multi-dimensional
     // for loops, followed by a loop collapsing pass.

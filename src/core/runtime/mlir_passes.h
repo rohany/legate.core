@@ -71,6 +71,19 @@ class GreedyLoopCollapsingPass : public mlir::PassWrapper<GreedyLoopCollapsingPa
   void runOnOperation() final;
 };
 
+// ReductionIdentityFoldingPass is a pass that folds away
+// reduction operations against the identity element for that
+// reduction. Many of these normalization rules are already
+// part of the MLIR canonicalization pass, but some of them
+// are missing from mainline MLIR. Managing the pass internally
+// to legate core avoids the need to deal with the implications
+// of getting these rewrites all the way into mainline.
+class ReductionIdentityFoldingPass : public mlir::PassWrapper<ReductionIdentityFoldingPass, mlir::OperationPass<mlir::ModuleOp>> {
+ public:
+  ReductionIdentityFoldingPass();
+  void runOnOperation() final;
+};
+
 // TODO (rohany): ............
 // TODO (rohany): WHY IS THIS HERE>>>>>>>>>>>>>>>>> RTTI NONSENSE
 /// A simple object cache following Lang's LLJITWithObjectCache example.
