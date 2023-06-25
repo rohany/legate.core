@@ -22,6 +22,7 @@
 #include "legion.h"
 
 #include "core/cuda/stream_pool.h"
+#include "core/data/buffer.h"
 
 #define EXTERNAL_LINKAGE  __attribute__((visibility("default")))
 
