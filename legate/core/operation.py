@@ -240,7 +240,7 @@ class Operation(OperationProtocol):
         operation will start the execution right upon the return of this
         method.
         """
-        self._context.runtime.submit(self)
+        runtime.submit(self)
 
     @staticmethod
     @external_store_reference_unwrapper_boilerplate
@@ -452,7 +452,6 @@ class Task(TaskProtocol):
         num_unbound_outs = len(self.unbound_outputs)
         num_scalar_outs = len(self.scalar_outputs)
         num_scalar_reds = len(self.scalar_reductions)
-        runtime = self.context.runtime
 
         num_all_scalars = (
             num_unbound_outs
@@ -508,7 +507,6 @@ class Task(TaskProtocol):
         num_unbound_outs = len(self.unbound_outputs)
         num_scalar_outs = len(self.scalar_outputs)
         num_scalar_reds = len(self.scalar_reductions)
-        runtime = self.context.runtime
 
         num_all_scalars = (
             num_unbound_outs
@@ -1062,7 +1060,7 @@ class ManualTask(Operation, Task):
                 continue
             # TODO: Need an interface for clients to specify isomorphism
             # bewteen unbound stores
-            fspace = self._context.runtime.create_field_space()
+            fspace = runtime.create_field_space()
             field_id = fspace.allocate_field(store.type)
             launcher.add_unbound_output(store, fspace, field_id)
 
@@ -1493,7 +1491,6 @@ class Reduce(AutoOperation):
             op_id=op_id,
             target_machine=target_machine,
         )
-        self._runtime = context.runtime
         self._radix = radix
         self._task_id = task_id
 
@@ -1561,7 +1558,7 @@ class Reduce(AutoOperation):
                 output = self._outputs[0]
             else:
                 output = self._context.create_store(input.type)
-            fspace = self._runtime.create_field_space()
+            fspace = runtime.create_field_space()
             field_id = fspace.allocate_field(input.type)
             launcher.add_unbound_output(output, fspace, field_id)
 
