@@ -1412,7 +1412,7 @@ class Runtime:
         # TODO (rohany): Have to change this to ask for
         #  feedback from the generated tasks, whether they can
         #  target the same task variants or not etc.
-        target_variant = self.core_task_variant_id
+        target_variant = self.variant_ids[self.machine.preferred_kind]
 
         # Now we have to actually generate a fused task body.
         # Things that need to be accomplished:
