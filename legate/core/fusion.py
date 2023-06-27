@@ -305,6 +305,7 @@ class TaskWindowDescriptor:
                 return counter + 1
 
         for op in ops:
+            # TODO (rohany): This might need library deduplication.
             self.task_ids.append(op._task_id)
 
             # Pack task scalar arguments into comparable buffers.
