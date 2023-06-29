@@ -94,11 +94,11 @@ if TYPE_CHECKING:
     from .communicator import Communicator
     from .context import Context
     from .corelib import CoreLib
-    from .operation import Operation
+    from .operation import AutoTask, Copy, ManualTask, Operation
     from .partition import PartitionBase
     from .projection import SymbolicPoint
     from .solver import Strategy
-    from .store import RegionField, Store
+    from .store import ExternalStoreReference, RegionField, Store
 
     ProjSpec = Tuple[int, SymbolicPoint]
     ShardSpec = Tuple[int, tuple[int, int], int, int]
@@ -986,7 +986,9 @@ class CommunicatorManager:
         self._runtime = runtime
         self._nccl = NCCLCommunicator(runtime)
 
-        self._cpu = None if settings.disable_mpi else CPUCommunicator(runtime)
+        self._cpu = (
+            None if settings.disable_mpi() else CPUCommunicator(runtime)
+        )
 
     def destroy(self) -> None:
         self._nccl.destroy()
@@ -1187,11 +1189,27 @@ class Runtime:
             ProcessorKind.CPU: self.core_library.LEGATE_CPU_VARIANT,
         }
 
+        self._array_type_cache: dict[tuple[ty.Dtype, int], ty.Dtype] = {}
+
         # Maintain a cache of generated kernels, holding the function
         # pointer to use for the kernel.
         self._generated_kernel_cache: dict[GeneratedTaskDescriptor, tuple[int, int]] = {}
         self._fused_task_window_cache: dict[TaskWindowDescriptor, FusedTaskConstructionDescriptor] = {}
         self._fusion_logger = Logger("fusion")
+        # _allow_fusion_compilation is a flag that application developers can
+        # interact with to ensure that complication does not occur within a
+        # section of application code.
+        self._allow_fusion_compilation = True
+
+    # {allow|block}_fusion_compilation are hints that application
+    # developers can provide to the runtime to throw an assertion
+    # failure if kernel compilation is occurring inside a user
+    # specified section of code where additional compilation is
+    # not expected.
+    def allow_kernel_compilation(self) -> None:
+        self._allow_fusion_compilation = True
+    def block_kernel_compilation(self) -> None:
+        self._allow_fusion_compilation = False
 
     @property
     def has_cpu_communicator(self) -> bool:
@@ -1245,10 +1263,6 @@ class Runtime:
         if len(self._machines) <= 1:
             raise RuntimeError("Machine stack underflow")
         self._machines.pop()
-
-    @property
-    def core_task_variant_id(self) -> int:
-        return self._variant_ids[self.machine.preferred_kind]
 
     @property
     def attachment_manager(self) -> AttachmentManager:
@@ -1414,7 +1428,7 @@ class Runtime:
         # TODO (rohany): Have to change this to ask for
         #  feedback from the generated tasks, whether they can
         #  target the same task variants or not etc.
-        target_variant = self.core_task_variant_id
+        target_variant = self.variant_ids[self.machine.preferred_kind]
 
         # Now we have to actually generate a fused task body.
         # Things that need to be accomplished:
@@ -1439,6 +1453,10 @@ class Runtime:
         if task_window_desc in self._fused_task_window_cache:
             fusionDesc = self._fused_task_window_cache[task_window_desc]
         else:
+            # If we've been requested by the application not to compile
+            # any new kernels, throw an error message.
+            if not self._allow_fusion_compilation:
+                raise AssertionError("New kernel compilation has been disallowed.")
             # We missed the cache, so do all of the necessary analysis.
             # First construct MLIR modules for each of the task bodies.
             modules = generate_mlir_modules(ops)
@@ -1448,12 +1466,25 @@ class Runtime:
 
             # We'll order the stores in the calling convention like [inputs, outputs, reductions],
             # so we can construct a mapping from a particular store to an index in this concatenation.
+            # This will currently overrwrite the mapping when the same store appears in multiple
+            # of the permission lists. This is currently intentional, and a special case around
+            # future reductions is handled below.
             store_id_to_index_mapping = {}
             index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
             for store in itertools.chain(new_inputs, new_outputs, new_reducs):
                 store_id_to_index_mapping[store._unique_id] = index
+                index += 1
+
+            # Future-backed reductions into stores require special handling
+            # when remapping. In particular, the core will create a special
+            # temporary buffer for reduction futures as the identity, so
+            # operations on reduction futures should not write into or
+            # read from any other buffers.
+            future_reducs_id_to_index_mapping = {}
+            index = len(new_inputs) + len(new_outputs)
+            for store in new_reducs:
+                if store._storage.kind is Future:
+                    future_reducs_id_to_index_mapping[store._unique_id] = index
                 index += 1
 
             # Construct a new MLIR module that fuses all of the tasks together
@@ -1464,7 +1495,8 @@ class Runtime:
                 [s.to_comp_time_store_desc() for s in new_inputs],
                 [s.to_comp_time_store_desc() for s in new_outputs],
                 [s.to_comp_time_store_desc() for s in new_reducs],
-                store_id_to_index_mapping
+                store_id_to_index_mapping,
+                future_reducs_id_to_index_mapping
             )
 
             # Here can be the application of Legate-specific transformations, such
@@ -1586,15 +1618,6 @@ class Runtime:
 
             fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
 
-            # Recompute the store_id_to_index_mapping after we have eliminated temporaries.
-            store_id_to_index_mapping = {}
-            index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
-            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                store_id_to_index_mapping[store._unique_id] = index
-                index += 1
-
             ######### Done Temporary Elimination
 
             # It is extremely unfortunate that normalization of memrefs for
@@ -1665,16 +1688,6 @@ class Runtime:
 
             new_inputs = inputs_after_intermediate_promotion
             fused.escalateIntermediateStorePrivilege(intermediate_input_indexes, resolved_input_indexes)
-
-            # TODO (rohany): Every time we change the set of inputs and outputs we have
-            #  to recompute this mapping.
-            store_id_to_index_mapping = {}
-            index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
-            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                store_id_to_index_mapping[store._unique_id] = index
-                index += 1
 
             ######### Standard pass application
 
@@ -1947,13 +1960,13 @@ class Runtime:
         future.set_value(self.legion_runtime, data, size)
         return future
 
-    def create_store(
-        self,
-        dtype: ty.Dtype,
-        shape: Optional[Union[Shape, tuple[int, ...]]] = None,
-        data: Optional[Union[RegionField, Future]] = None,
-        optimize_scalar: bool = False,
-        ndim: Optional[int] = None,
+    def create_store_internal(
+            self,
+            dtype: ty.Dtype,
+            shape: Optional[Union[Shape, tuple[int, ...]]] = None,
+            data: Optional[Union[RegionField, Future]] = None,
+            optimize_scalar: bool = False,
+            ndim: Optional[int] = None,
     ) -> Store:
         from .store import RegionField, Storage, Store
 
@@ -2003,6 +2016,222 @@ class Runtime:
             shape=shape,
             ndim=ndim,
         )
+
+    def create_store(
+        self,
+        dtype: ty.Dtype,
+        shape: Optional[Union[Shape, tuple[int, ...]]] = None,
+        data: Optional[Union[RegionField, Future]] = None,
+        optimize_scalar: bool = False,
+        ndim: Optional[int] = None,
+    ) -> ExternalStoreReference:
+        from .store import ExternalStoreReference
+        return ExternalStoreReference(
+            self.create_store_internal(
+                dtype,
+                shape=shape,
+                data=data,
+                optimize_scalar=optimize_scalar,
+                ndim=ndim,
+            )
+        )
+
+    def create_manual_task(
+        self,
+        context: Context,
+        task_id: int,
+        launch_domain: Rect,
+    ) -> ManualTask:
+        """
+        Creates a manual task.
+
+        Parameters
+        ----------
+        context: Context
+            Library to which the task id belongs
+
+        task_id : int
+            Task id. Scoped locally within the context; i.e., different
+            libraries can use the same task id. There must be a task
+            implementation corresponding to the task id.
+
+        launch_domain : Rect, optional
+            Launch domain of the task.
+
+        Returns
+        -------
+        ManualTask
+            A new task
+        """
+
+        from .operation import ManualTask
+
+        # Check if the task id is valid for this library and the task
+        # has the right variant
+        machine = context.slice_machine_for_task(task_id)
+        unique_op_id = self.get_unique_op_id()
+        if launch_domain is None:
+            raise RuntimeError(
+                "Launch domain must be specified for manual parallelization"
+            )
+
+        return ManualTask(
+            context,
+            task_id,
+            launch_domain,
+            unique_op_id,
+            machine,
+        )
+
+    def create_auto_task(
+        self,
+        context: Context,
+        task_id: int,
+    ) -> AutoTask:
+        """
+        Creates an auto task.
+
+        Parameters
+        ----------
+        context: Context
+            Library to which the task id belongs
+
+        task_id : int
+            Task id. Scoped locally within the context; i.e., different
+            libraries can use the same task id. There must be a task
+            implementation corresponding to the task id.
+
+        Returns
+        -------
+        AutoTask
+            A new automatically parallelized task
+
+        See Also
+        --------
+        Context.create_task
+        """
+
+        from .operation import AutoTask
+
+        # Check if the task id is valid for this library and the task
+        # has the right variant
+        machine = context.slice_machine_for_task(task_id)
+        unique_op_id = self.get_unique_op_id()
+        return AutoTask(context, task_id, unique_op_id, machine)
+
+    def create_copy(self) -> Copy:
+        """
+        Creates a copy operation.
+
+        Returns
+        -------
+        Copy
+            A new copy operation
+        """
+
+        from .operation import Copy
+
+        return Copy(
+            self.core_context,
+            self.get_unique_op_id(),
+            self.machine,
+        )
+
+    def issue_fill(
+        self,
+        lhs: Store,
+        value: Store,
+    ) -> None:
+        """
+        Fills the store with a constant value.
+
+        Parameters
+        ----------
+        lhs : Store
+            Store to fill
+
+        value : Store
+            Store holding the constant value to fill the ``lhs`` with
+
+        Raises
+        ------
+        ValueError
+            If the ``value`` is not scalar or the ``lhs`` is either unbound or
+            scalar
+        """
+        from .operation import Fill
+        from .store import ExternalStoreReference
+        if isinstance(lhs, ExternalStoreReference):
+            lhs = lhs._base
+        if isinstance(value, ExternalStoreReference):
+            value = value._base
+
+        fill = Fill(
+            self.core_context,
+            lhs,
+            value,
+            self.get_unique_op_id(),
+            self.machine,
+        )
+        fill.execute()
+
+    # TODO (rohany): I don't think that this needs a wrapper.
+    def tree_reduce(
+        self, context: Context, task_id: int, store: Store, radix: int = 4
+    ) -> Store:
+        """
+        Performs a user-defined reduction by building a tree of reduction
+        tasks. At each step, the reducer task gets up to ``radix`` input stores
+        and is supposed to produce outputs in a single unbound store.
+
+        Parameters
+        ----------
+        context : Context
+            Library to which the task id belongs
+
+        task_id : int
+            Id of the reducer task
+
+        store : Store
+            Store to perform reductions on
+
+        radix : int
+            Fan-in of each reducer task. If the store is partitioned into
+            :math:`N` sub-stores by the runtime, then the first level of
+            reduction tree has :math:`\\ceil{N / \\mathtt{radix}}` reducer
+            tasks.
+
+        Returns
+        -------
+        Store
+            Store that contains reduction results
+        """
+        from .operation import Reduce
+
+        from .store import ExternalStoreReference
+        if isinstance(store, ExternalStoreReference):
+            store = store._base
+
+        if store.ndim > 1:
+            raise NotImplementedError(
+                "Tree reduction doesn't currently support "
+                "multi-dimensional stores"
+            )
+
+        result = self.create_store_internal(store.type)
+
+        # A single Reduce operation is mapped to a whole reduction tree
+        task = Reduce(
+            context,
+            task_id,
+            radix,
+            self.get_unique_op_id(),
+            self.machine,
+        )
+        task.add_input(store)
+        task.add_output(result)
+        task.execute()
+        return result
 
     def find_region_manager(self, region: Region) -> RegionManager:
         assert region in self.region_managers_by_region
@@ -2166,7 +2395,6 @@ class Runtime:
         launcher = TaskLauncher(
             self.core_context,
             self.core_library.LEGATE_CORE_EXTRACT_SCALAR_TASK_ID,
-            tag=self.core_task_variant_id,
         )
         launcher.add_future(future)
         launcher.add_scalar_arg(idx, ty.int32)
@@ -2180,7 +2408,6 @@ class Runtime:
         launcher = TaskLauncher(
             self.core_context,
             self.core_library.LEGATE_CORE_EXTRACT_SCALAR_TASK_ID,
-            tag=self.core_task_variant_id,
         )
         launcher.add_future_map(future)
         launcher.add_scalar_arg(idx, ty.int32)
@@ -2216,6 +2443,17 @@ class Runtime:
             )
 
     def issue_execution_fence(self, block: bool = False) -> None:
+        """
+        Issues an execution fence. A fence is a special operation that
+        guarantees that all upstream operations finish before any of the
+        downstream operations start. The caller can optionally block on
+        completion of all upstream operations.
+
+        Parameters
+        ----------
+        block : bool
+            If ``True``, the call blocks until all upstream operations finish.
+        """
         fence = Fence(mapping=False)
         future = fence.launch(self.legion_runtime, self.legion_context)
         if block:
@@ -2354,6 +2592,34 @@ class Runtime:
                 return result
 
         return wrapper
+
+    def find_or_create_array_type(
+        self, elem_type: ty.Dtype, n: int
+    ) -> ty.Dtype:
+        """
+        Finds or creates a fixed array type for a given element type and a
+        size.
+
+        Returns the same array type for the same element type and array size.
+
+        Parameters
+        ----------
+        elem_type : Dtype
+            Element type
+
+        n : int
+            Array size
+
+        Returns
+        -------
+        Dtype
+            Fixed-size array type unique to each pair of an element type and
+            a size
+        """
+        key = (elem_type, n)
+        if key not in self._array_type_cache:
+            self._array_type_cache[key] = ty.array_type(elem_type, n)
+        return self._array_type_cache[key]
 
 
 runtime: Runtime = Runtime(core_library)

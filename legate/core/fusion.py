@@ -305,6 +305,7 @@ class TaskWindowDescriptor:
                 return counter + 1
 
         for op in ops:
+            # TODO (rohany): This might need library deduplication.
             self.task_ids.append(op._task_id)
 
             # Pack task scalar arguments into comparable buffers.
@@ -356,6 +357,18 @@ class TaskWindowDescriptor:
             hash(tuple(self.store_generic_ids)),
             hash(tuple(self.storage_generic_ids)),
         ))
+
+    def __str__(self):
+        return f"TaskWindowDescriptor(\n" \
+               f"  {self.task_ids},\n" \
+               f"  {self.task_scalar_args},\n" \
+               f"  {self.store_types},\n" \
+               f"  {self.store_dims},\n" \
+               f"  {self.store_transforms},\n" \
+               f"  {self.store_liveness},\n" \
+               f"  {self.store_generic_ids},\n" \
+               f"  {self.storage_generic_ids}\n" \
+               f")"
 
     def __hash__(self):
         return self._hash
