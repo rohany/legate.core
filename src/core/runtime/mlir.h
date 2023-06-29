@@ -103,7 +103,8 @@ class MLIRModule {
       const std::vector<CompileTimeStoreDescriptor>& inputs,
       const std::vector<CompileTimeStoreDescriptor>& outputs,
       const std::vector<CompileTimeStoreDescriptor>& reducs,
-      const std::map<int64_t, int32_t>& storeIDToIndexMapping
+      const std::map<int64_t, int32_t>& storeIDToIndexMapping,
+      const std::map<int64_t, int32_t>& futureReducsToIndexMapping
     );
  public:
     // TODO (rohany): This is not the final view of what this function

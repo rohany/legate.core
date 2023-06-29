@@ -516,7 +516,8 @@ std::unique_ptr<MLIRModule> MLIRModule::fuseModules(
   const std::vector<CompileTimeStoreDescriptor>& inputs,
   const std::vector<CompileTimeStoreDescriptor>& outputs,
   const std::vector<CompileTimeStoreDescriptor>& reducs,
-  const std::map<int64_t, int32_t>& storeIDToIndexMapping
+  const std::map<int64_t, int32_t>& storeIDToIndexMapping,
+  const std::map<int64_t, int32_t>& futureReducsToIndexMapping
 ) {
   _MLIR_NVTX_RANGE("fuseModules")
 
@@ -562,7 +563,14 @@ std::unique_ptr<MLIRModule> MLIRModule::fuseModules(
       index++;
     }
     for (auto& store : mlirModule->reducs_) {
-      argumentMapper.map(header.getArgument(index), block->getArgument(storeIDToIndexMapping.at(store.id)));
+      // Future-backed stores we're reducing into require special handling. See
+      // comments in the high-level task-fusion pipeline about this.
+      auto it = futureReducsToIndexMapping.find(store.id);
+      if (it != futureReducsToIndexMapping.end()) {
+        argumentMapper.map(header.getArgument(index), block->getArgument(it->second));
+      } else {
+        argumentMapper.map(header.getArgument(index), block->getArgument(storeIDToIndexMapping.at(store.id)));
+      }
       index++;
     }
 

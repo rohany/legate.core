@@ -1446,12 +1446,25 @@ class Runtime:
 
             # We'll order the stores in the calling convention like [inputs, outputs, reductions],
             # so we can construct a mapping from a particular store to an index in this concatenation.
+            # This will currently overrwrite the mapping when the same store appears in multiple
+            # of the permission lists. This is currently intentional, and a special case around
+            # future reductions is handled below.
             store_id_to_index_mapping = {}
             index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
             for store in itertools.chain(new_inputs, new_outputs, new_reducs):
                 store_id_to_index_mapping[store._unique_id] = index
+                index += 1
+
+            # Future-backed reductions into stores require special handling
+            # when remapping. In particular, the core will create a special
+            # temporary buffer for reduction futures as the identity, so
+            # operations on reduction futures should not write into or
+            # read from any other buffers.
+            future_reducs_id_to_index_mapping = {}
+            index = len(new_inputs) + len(new_outputs)
+            for store in new_reducs:
+                if store._storage.kind is Future:
+                    future_reducs_id_to_index_mapping[store._unique_id] = index
                 index += 1
 
             # Construct a new MLIR module that fuses all of the tasks together
@@ -1462,7 +1475,8 @@ class Runtime:
                 [s.to_comp_time_store_desc() for s in new_inputs],
                 [s.to_comp_time_store_desc() for s in new_outputs],
                 [s.to_comp_time_store_desc() for s in new_reducs],
-                store_id_to_index_mapping
+                store_id_to_index_mapping,
+                future_reducs_id_to_index_mapping
             )
 
             # Here can be the application of Legate-specific transformations, such
@@ -1584,15 +1598,6 @@ class Runtime:
 
             fused.promoteTemporaryStores(temporary_store_ordinals, resolved_shape_ordinals)
 
-            # Recompute the store_id_to_index_mapping after we have eliminated temporaries.
-            store_id_to_index_mapping = {}
-            index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
-            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                store_id_to_index_mapping[store._unique_id] = index
-                index += 1
-
             ######### Done Temporary Elimination
 
             # It is extremely unfortunate that normalization of memrefs for
@@ -1663,16 +1668,6 @@ class Runtime:
 
             new_inputs = inputs_after_intermediate_promotion
             fused.escalateIntermediateStorePrivilege(intermediate_input_indexes, resolved_input_indexes)
-
-            # TODO (rohany): Every time we change the set of inputs and outputs we have
-            #  to recompute this mapping.
-            store_id_to_index_mapping = {}
-            index = 0
-            # TODO (rohany): Haven't yet handled when the same store appears in
-            #  both the inputs and outputs here.
-            for store in itertools.chain(new_inputs, new_outputs, new_reducs):
-                store_id_to_index_mapping[store._unique_id] = index
-                index += 1
 
             ######### Standard pass application
 

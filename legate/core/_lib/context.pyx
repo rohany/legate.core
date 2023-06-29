@@ -117,6 +117,7 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
           const vector[CompileTimeStoreDescriptor]&,
           const vector[CompileTimeStoreDescriptor]&,
           const vector[CompileTimeStoreDescriptor]&,
+          const map[int64_t, int32_t]&,
           const map[int64_t, int32_t]&
         )
         void promoteTemporaryStores(
@@ -262,13 +263,15 @@ cdef class PyMLIRModule:
         list input_stores,
         list output_stores,
         list reduc_stores,
-        dict store_id_to_index_mapping
+        dict store_id_to_index_mapping,
+        dict future_reducs_id_to_index_mapping
     ) -> PyMLIRModule:
         cdef vector[MLIRModule*] module_ptrs = vector[MLIRModulePtr](len(modules))
         cdef vector[CompileTimeStoreDescriptor] inputs = vector[CompileTimeStoreDescriptor](len(input_stores))
         cdef vector[CompileTimeStoreDescriptor] outputs = vector[CompileTimeStoreDescriptor](len(output_stores))
         cdef vector[CompileTimeStoreDescriptor] reducs = vector[CompileTimeStoreDescriptor](len(reduc_stores))
         cdef map[int64_t, int32_t] store_id_to_index = map[int64_t, int32_t]();
+        cdef map[int64_t, int32_t] future_reducs_to_index = map[int64_t, int32_t]();
 
         # Copy over all of the store descriptors into the C++ vectors.
         cdef int i
@@ -281,9 +284,11 @@ cdef class PyMLIRModule:
         for i in range(len(modules)):
           module_ptrs[i] = (<PyMLIRModule?>modules[i])._module.get()
 
-        # Also convert the mapping into a C++ object.
+        # Convert the mappings into C++ objects.
         for id, idx in store_id_to_index_mapping.items():
           store_id_to_index[id] = idx
+        for id, idx in future_reducs_id_to_index_mapping.items():
+          future_reducs_to_index[id] = idx
 
         # TODO (rohany): If this ends up being used in one more place, we'll extract
         #  it into a method somewhere else.
@@ -297,7 +302,8 @@ cdef class PyMLIRModule:
           inputs,
           outputs,
           reducs,
-          store_id_to_index
+          store_id_to_index,
+          future_reducs_to_index
         )
         return PyMLIRModule.from_unique_ptr(move(result))
 
