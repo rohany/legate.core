@@ -1194,6 +1194,20 @@ class Runtime:
         self._generated_kernel_cache: dict[GeneratedTaskDescriptor, tuple[int, int]] = {}
         self._fused_task_window_cache: dict[TaskWindowDescriptor, FusedTaskConstructionDescriptor] = {}
         self._fusion_logger = Logger("fusion")
+        # _allow_fusion_compilation is a flag that application developers can
+        # interact with to ensure that complication does not occur within a
+        # section of application code.
+        self._allow_fusion_compilation = True
+
+    # {allow|block}_fusion_compilation are hints that application
+    # developers can provide to the runtime to throw an assertion
+    # failure if kernel compilation is occurring inside a user
+    # specified section of code where additional compilation is
+    # not expected.
+    def allow_kernel_compilation(self) -> None:
+        self._allow_fusion_compilation = True
+    def block_kernel_compilation(self) -> None:
+        self._allow_fusion_compilation = False
 
     @property
     def has_cpu_communicator(self) -> bool:
@@ -1437,6 +1451,10 @@ class Runtime:
         if task_window_desc in self._fused_task_window_cache:
             fusionDesc = self._fused_task_window_cache[task_window_desc]
         else:
+            # If we've been requested by the application not to compile
+            # any new kernels, throw an error message.
+            if not self._allow_fusion_compilation:
+                raise AssertionError("New kernel compilation has been disallowed.")
             # We missed the cache, so do all of the necessary analysis.
             # First construct MLIR modules for each of the task bodies.
             modules = generate_mlir_modules(ops)
