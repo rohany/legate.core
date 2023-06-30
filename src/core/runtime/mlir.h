@@ -194,7 +194,7 @@ class MLIRTask {
 public:
   // register_variant (possibly renamed) is used to register a particular
   // task variant of the MLIR task
-  static void register_variant(std::string& name, int task_id, LegateVariantCode code);
+  static void register_variant(std::string& name, int task_id, LegateVariantCode code, uintptr_t funcPtr);
 public:
   static void body(legate::TaskContext& context);
 };

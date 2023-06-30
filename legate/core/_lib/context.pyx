@@ -100,7 +100,7 @@ cdef extern from "core/runtime/mlir.h" namespace "legate" nogil:
 
     cdef cppclass MLIRTask:
         @staticmethod
-        void register_variant(string, int, legate_core_variant_t)
+        void register_variant(string, int, legate_core_variant_t, uintptr_t)
 
     cdef cppclass MLIRModule:
         void normalizeMemrefs(MLIRRuntime*)
@@ -338,8 +338,8 @@ cdef class PyMLIRModule:
 
 cdef class PyMLIRTask:
     @staticmethod
-    def register_variant(str name, int id, int variantCode):
-        MLIRTask.register_variant(name.encode(), id, cython.cast(legate_core_variant_t, variantCode))
+    def register_variant(str name, int id, int variantCode, long long funcPtr):
+        MLIRTask.register_variant(name.encode(), id, cython.cast(legate_core_variant_t, variantCode), funcPtr)
 
 
 cdef class PyMLIRTaskBodyGenerator:

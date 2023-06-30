@@ -397,10 +397,12 @@ class FusedTaskConstructionDescriptor:
             inputs: List[Store],
             outputs: List[Store],
             reducs: List[Store],
-            taskid: int,
+            local_taskid: int,
+            global_taskid: int,
             funcptr: int,
     ):
-        self.taskid = taskid
+        self.local_taskid = local_taskid
+        self.global_taskid = global_taskid
         self.funcptr = funcptr
 
         # Maintain a separate mapping for each list, because if the same store
@@ -427,14 +429,14 @@ class FusedTaskConstructionDescriptor:
 
     def build_task(self, ops: List[Task], strategies: List[Strategy]) -> Tuple[Operation, Strategy]:
         # TODO (rohany): Worry about when these ops come from different libraries.
-        newTask = ops[0].context.create_auto_task(self.taskid)
+        newTask = ops[0].context.create_auto_task(self.local_taskid)
         self.add_stores_to_task(newTask, ops)
         self.add_impl_to_task(newTask)
         newStrat = self.build_new_strategy(newTask, ops, strategies)
         return newTask, newStrat
 
     def add_impl_to_task(self, fused: AutoTask):
-        fused.add_scalar_arg(self.funcptr, ty.uint64)
+        fused.add_scalar_arg(self.global_taskid, ty.uint32)
 
     def add_stores_to_task(self, fused: AutoTask, ops: List[Task]):
         for opidx, storeidx in self.inputs:

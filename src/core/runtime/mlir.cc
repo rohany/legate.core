@@ -38,7 +38,6 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 
-
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
@@ -73,6 +72,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include <iostream>
+#include <shared_mutex>
 
 #ifdef LEGATE_USE_CUDA
 #define _MLIR_NVTX_RANGE(s) nvtx::Range auto_range(s);
@@ -731,8 +731,15 @@ CompileTimeStoreDescriptor::CompileTimeStoreDescriptor(
   std::shared_ptr<TransformStack> transform
 ) : ndim(ndim), typ(static_cast<Type::Code>(typ)), id(id), transform(transform) {}
 
+// Each address space will manage a table mapping the Legion task ID
+// to the concrete function pointer emitted from LLVM. We'll protect
+// this table with a reader-writer lock so that task invocations can
+// hopefully proceed with little overhead.
+static std::shared_mutex functionPointerTableLock_;
+static std::unordered_map<Legion::TaskID, uintptr_t> functionPointerTable_;
+
 /* static */
-void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCode code) {
+void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCode code, uintptr_t funcPtr) {
   auto runtime = Legion::Runtime::get_runtime();
   runtime->attach_name(task_id, name.c_str(), false /* mutable */, true /* local_only */);
 
@@ -766,6 +773,11 @@ void MLIRTask::register_variant(std::string& name, int task_id, LegateVariantCod
     registrar.set_leaf();
     constexpr auto wrapper = detail::legate_task_wrapper<MLIRTask::body>;
     runtime->register_task_variant(registrar, Legion::CodeDescriptor(wrapper), nullptr, 0, LEGATE_MAX_SIZE_SCALAR_RETURN, code);
+  }
+  // Register the function pointer in the address space local table.
+  {
+    std::unique_lock lock(functionPointerTableLock_);
+    functionPointerTable_[task_id] = funcPtr;
   }
 }
 
@@ -840,8 +852,15 @@ void MLIRTask::body(TaskContext& context) {
   //  passing scalars to the tasks yet.
   assert(scalars.size() == 1);
 
+  static_assert(sizeof(Legion::TaskID) == sizeof(uint32_t));
+  auto taskID = scalars[0].value<Legion::TaskID>();
+  uintptr_t funcPtrValue;
+  {
+    std::shared_lock lock(functionPointerTableLock_);
+    funcPtrValue = functionPointerTable_[taskID];
+  }
   typedef void (*func_t) (void**);
-  auto func = scalars[0].value<func_t>();
+  auto func = reinterpret_cast<func_t>(funcPtrValue);
 
   // TODO (rohany): Generating the body would also allow us to not malloc
   //  a bunch of times on each task invocation...

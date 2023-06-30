@@ -1703,8 +1703,17 @@ class Runtime:
             funcptr = fused.jitToLLVM()
 
             local_task_id = ops[0].context.get_fresh_local_task_id()
-            PyMLIRTask.register_variant("FUSED_TASK", op.context.get_task_id(local_task_id), target_variant)
-            fusionDesc = FusedTaskConstructionDescriptor(ops, new_inputs, new_outputs, new_reducs, local_task_id, funcptr)
+            global_task_id = op.context.get_task_id(local_task_id)
+            PyMLIRTask.register_variant("FUSED_TASK", global_task_id, target_variant, funcptr)
+            fusionDesc = FusedTaskConstructionDescriptor(
+                ops,
+                new_inputs,
+                new_outputs,
+                new_reducs,
+                local_task_id,
+                global_task_id,
+                funcptr
+            )
             self._fused_task_window_cache[task_window_desc] = fusionDesc
         return fusionDesc.build_task(ops, strategies)
 
