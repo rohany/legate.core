@@ -1450,7 +1450,7 @@ class Runtime:
         #    super-task that actually optimize the resulting code.
 
         task_window_desc = TaskWindowDescriptor(ops)
-        if task_window_desc in self._fused_task_window_cache:
+        if settings.enable_kernel_cache() and task_window_desc in self._fused_task_window_cache:
             fusionDesc = self._fused_task_window_cache[task_window_desc]
         else:
             # If we've been requested by the application not to compile

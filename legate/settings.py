@@ -245,5 +245,14 @@ class LegateRuntimeSettings(Settings):
         help="Enable kernel fusion with MLIR",
     )
 
+    enable_kernel_cache: EnvOnlySetting[bool] = EnvOnlySetting(
+        "enable_kernel_cache",
+        "LEGATE_KERNEL_CACHE",
+        default=True,
+        test_default=True,
+        convert=convert_bool,
+        help="Enable the compiled kernel cache"
+    )
+
 
 settings = LegateRuntimeSettings()
